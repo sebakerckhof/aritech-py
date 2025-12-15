@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aritech-ats"
+name = "aritech-client"
 version = "0.2.0"
 description = "Unofficial Python client library for ATS alarm panels"
 readme = "README.md"
@@ -40,14 +40,14 @@ dev = [
 ]
 
 [project.scripts]
-aritech-cli = "aritech_ats.cli:main"
+aritech-cli = "aritech_client.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sebakerckhof/atsadvisor"
 Repository = "https://github.com/sebakerckhof/atsadvisor"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aritech_ats"]
+packages = ["src/aritech_client"]
 
 [tool.ruff]
 line-length = 100
@@ -58,7 +58,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "ASYNC"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["aritech_ats"]
+known-first-party = ["aritech_client"]
 
 [tool.mypy]
 python_version = "3.11"

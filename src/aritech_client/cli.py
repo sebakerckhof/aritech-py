@@ -3,7 +3,7 @@
 Aritech ATS CLI - Command-line interface for ATS alarm panels.
 
 Usage:
-    python -m aritech_ats.cli --host 192.168.1.100 --pin 1234 zones
+    python -m aritech_client.cli --host 192.168.1.100 --pin 1234 zones
     aritech-cli --host 192.168.1.100 --pin 1234 areas
 """
 

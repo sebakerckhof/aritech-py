@@ -18,7 +18,7 @@ Note that protocol behavior may vary based on panel firmware version. This libra
 ## Installation
 
 ```bash
-pip install aritech-ats
+pip install aritech-client
 ```
 
 Or install from source:
@@ -50,7 +50,7 @@ aritech-cli --help
 Or run directly with Python:
 
 ```bash
-python -m aritech_ats.cli --help
+python -m aritech_client.cli --help
 ```
 
 For troubleshooting, enable debug logging:
@@ -111,7 +111,7 @@ The library uses asyncio for all communication with the panel:
 
 ```python
 import asyncio
-from aritech_ats import AritechClient, AritechConfig
+from aritech_client import AritechClient, AritechConfig
 
 async def main():
     config = AritechConfig(
@@ -145,8 +145,8 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from aritech_ats import AritechClient, AritechConfig
-from aritech_ats.monitor import AritechMonitor
+from aritech_client import AritechClient, AritechConfig
+from aritech_client.monitor import AritechMonitor
 
 async def main():
     config = AritechConfig(
