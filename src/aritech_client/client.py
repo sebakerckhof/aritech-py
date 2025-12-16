@@ -199,6 +199,12 @@ class AritechClient:
         # Pending response future - commands wait on this for their response
         self._pending_response: asyncio.Future[bytes] | None = None
 
+        # Command queue lock - ensures control operations are serialized
+        # This prevents conflicts when:
+        # 1. The same entity can only have one active control session
+        # 2. Requests don't have unique IDs, so responses must be sequential
+        self._command_lock: asyncio.Lock = asyncio.Lock()
+
     @property
     def panel_model(self) -> str | None:
         """Panel model (e.g., 'ATS1500')."""
@@ -876,6 +882,10 @@ class AritechClient:
         Creates a control session, yields the session ID, and ensures
         cleanup (destroyControlSession) runs even on failure.
 
+        Uses a lock to serialize all control operations, preventing conflicts when:
+        1. The same entity can only have one active control session
+        2. Requests don't have unique IDs, so responses must be sequential
+
         Args:
             create_msg_name: Message name for creating the session
             create_props: Properties for the create message
@@ -888,25 +898,26 @@ class AritechClient:
         Raises:
             AritechError: If session creation fails
         """
-        create_payload = construct_message(create_msg_name, create_props)
-        response = await self._call_encrypted(create_payload, self._session_key)
+        async with self._command_lock:
+            create_payload = construct_message(create_msg_name, create_props)
+            response = await self._call_encrypted(create_payload, self._session_key)
 
-        cc = parse_create_cc_response(response)
-        if not cc:
-            raise AritechError(
-                f"Failed to create control context for {entity_type} {entity_id}",
-                code=ErrorCode.CREATE_CC_FAILED,
-            )
+            cc = parse_create_cc_response(response)
+            if not cc:
+                raise AritechError(
+                    f"Failed to create control context for {entity_type} {entity_id}",
+                    code=ErrorCode.CREATE_CC_FAILED,
+                )
 
-        session_id = cc["sessionId"]
-        try:
-            yield session_id
-        finally:
-            await self._call_encrypted(
-                construct_message("destroyControlSession", {"sessionId": session_id}),
-                self._session_key,
-                raise_on_error=False,
-            )
+            session_id = cc["sessionId"]
+            try:
+                yield session_id
+            finally:
+                await self._call_encrypted(
+                    construct_message("destroyControlSession", {"sessionId": session_id}),
+                    self._session_key,
+                    raise_on_error=False,
+                )
 
     # ========================================================================
     # Area operations
@@ -1474,6 +1485,13 @@ class AritechClient:
             set_type: Arm type ('full', 'part1', 'part2')
             force: Force arm despite faults
         """
+        async with self._command_lock:
+            await self._arm_area_impl(areas, set_type, force)
+
+    async def _arm_area_impl(
+        self, areas: int | list[int], set_type: str = "full", force: bool = False
+    ) -> None:
+        """Internal implementation of arm_area (called with lock held)."""
         area_list = areas if isinstance(areas, list) else [areas]
         logger.debug(f"Arming area(s) {area_list} ({set_type}, force={force})...")
 
@@ -1732,6 +1750,11 @@ class AritechClient:
 
     async def disarm_area(self, area_num: int) -> None:
         """Disarm an area."""
+        async with self._command_lock:
+            await self._disarm_area_impl(area_num)
+
+    async def _disarm_area_impl(self, area_num: int) -> None:
+        """Internal implementation of disarm_area (called with lock held)."""
         logger.debug(f"Disarming area {area_num}...")
 
         create_payload = construct_message(
