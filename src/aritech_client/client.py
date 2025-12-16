@@ -170,8 +170,6 @@ class AritechClient:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._receive_buffer = bytearray()
-        self._response_queue: list[bytes] = []
-        self._pending_future: asyncio.Future[bytes] | None = None
 
         # Event listeners for COS events
         self._event_listeners: list[Callable[[bytes], Coroutine[Any, Any, None]]] = []
@@ -196,11 +194,10 @@ class AritechClient:
         # Keep-alive task
         self._keepalive_task: asyncio.Task[None] | None = None
 
-        # Background reader task for COS events
+        # Background reader task - single reader that fans out messages
         self._reader_task: asyncio.Task[None] | None = None
-        self._read_lock = asyncio.Lock()
-        self._cos_event_queue: list[tuple[int | None, bytes]] = []
-        self._reader_paused = False
+        # Pending response future - commands wait on this for their response
+        self._pending_response: asyncio.Future[bytes] | None = None
 
     @property
     def panel_model(self) -> str | None:
@@ -450,52 +447,42 @@ class AritechClient:
             self._keepalive_task = None
 
     def start_background_reader(self) -> None:
-        """Start background reader task for COS events."""
+        """Start background reader task that fans out all incoming messages."""
         if self._reader_task:
             return
 
         async def reader_loop() -> None:
-            """Continuously read frames and check for COS events."""
+            """
+            Single reader that handles ALL incoming frames.
+
+            - COS events → queued and processed via callbacks
+            - Command responses → delivered to waiting command via Future
+            """
             logger.debug("Background reader started")
             frame_count = 0
+
             while self._monitoring_active and self._reader and self._session_key:
-                # Check if paused for COS event processing
-                if self._reader_paused:
-                    await asyncio.sleep(0.1)
-                    continue
-
                 try:
-                    async with self._read_lock:
-                        # Try to read a frame with short timeout
-                        frame = await self._read_frame_nonblocking(timeout=1.0)
-                        if frame:
-                            frame_count += 1
-                            logger.debug(f"Background reader got frame #{frame_count}: {len(frame)} bytes")
-                            # Try to decrypt and log what it is
-                            try:
-                                decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
-                                if decrypted:
-                                    logger.debug(f"  Decrypted: {decrypted[:20].hex()}...")
-                            except Exception:
-                                pass
-                            # Check if it's a COS event - queue it for processing
-                            cos_info = self._check_for_cos_event(frame)
-                            if cos_info:
-                                logger.debug("  -> COS event queued!")
-                                # Process COS event with reader paused
-                                self._reader_paused = True
-                            else:
-                                # Queue non-COS frames for regular processing
-                                self._response_queue.append(frame)
-                                logger.debug("  -> Queued as regular response")
-                                # Wake up any pending receiver
-                                if self._pending_future and not self._pending_future.done():
-                                    self._pending_future.set_result(frame)
+                    # Read next frame (with timeout so we can check _monitoring_active)
+                    frame = await self._read_frame_direct(timeout=1.0)
+                    if not frame:
+                        continue
 
-                    # Process any queued COS events outside the lock
-                    if self._reader_paused and self._cos_event_queue:
-                        await self._process_cos_queue()
-                        self._reader_paused = False
+                    frame_count += 1
+                    logger.debug(f"Background reader got frame #{frame_count}: {len(frame)} bytes")
+
+                    # Check if it's a COS event
+                    if self._is_cos_event(frame):
+                        logger.debug("  -> COS event, processing...")
+                        await self._handle_cos_frame(frame)
+                    else:
+                        # It's a command response - deliver to waiting command
+                        logger.debug("  -> Command response")
+                        if self._pending_response and not self._pending_response.done():
+                            self._pending_response.set_result(frame)
+                        else:
+                            # No one waiting - this shouldn't happen normally
+                            logger.debug("  -> No pending command, discarding")
 
                 except asyncio.TimeoutError:
                     # No data available, continue polling
@@ -505,28 +492,13 @@ class AritechClient:
                 except Exception as e:
                     logger.debug(f"Background reader error: {e}")
                     await asyncio.sleep(0.1)
+
             logger.debug(f"Background reader stopped (read {frame_count} frames)")
 
         self._reader_task = asyncio.create_task(reader_loop())
 
-    async def _process_cos_queue(self) -> None:
-        """Process all queued COS events."""
-        while self._cos_event_queue:
-            status_byte, payload = self._cos_event_queue.pop(0)
-            for listener in self._event_listeners:
-                try:
-                    await listener(status_byte, payload)
-                except Exception as e:
-                    logger.error(f"Error in COS listener: {e}")
-
-    def stop_background_reader(self) -> None:
-        """Stop background reader task."""
-        if self._reader_task:
-            self._reader_task.cancel()
-            self._reader_task = None
-
-    async def _read_frame_nonblocking(self, timeout: float = 1.0) -> bytes | None:
-        """Read a single SLIP frame with timeout, non-blocking."""
+    async def _read_frame_direct(self, timeout: float = 5.0) -> bytes | None:
+        """Read a single SLIP frame directly from socket (no fan-out logic)."""
         if not self._reader:
             return None
 
@@ -557,7 +529,60 @@ class AritechClient:
                     return None
                 self._receive_buffer.extend(data)
             except asyncio.TimeoutError:
-                raise
+                if asyncio.get_event_loop().time() >= end_time:
+                    raise
+                # Short timeout for responsiveness, continue
+
+    def _is_cos_event(self, frame: bytes) -> bool:
+        """Check if frame is a COS event (without queueing it)."""
+        if not self._session_key:
+            return False
+
+        try:
+            decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
+            if not decrypted or len(decrypted) < 3:
+                return False
+
+            # COS event format: [0xC0 header][0xCA 0x00 msgId 37][payload...]
+            return decrypted[0] == 0xC0 and decrypted[1] == 0xCA and decrypted[2] == 0x00
+        except Exception:
+            return False
+
+    async def _handle_cos_frame(self, frame: bytes) -> None:
+        """Process a COS event frame by spawning listener tasks (non-blocking)."""
+        try:
+            decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
+            if not decrypted:
+                return
+
+            payload = decrypted[3:]  # Skip C0 CA 00
+            status_byte = payload[2] if len(payload) >= 3 else None
+
+            # Spawn listener tasks - don't await them!
+            # This prevents deadlock: listeners may send commands that need
+            # responses from the background reader, so we can't block here.
+            for listener in self._event_listeners:
+                asyncio.create_task(self._run_cos_listener(listener, status_byte, payload))
+        except Exception as e:
+            logger.error(f"Error handling COS frame: {e}")
+
+    async def _run_cos_listener(
+        self,
+        listener: Callable[[int | None, bytes], Coroutine[Any, Any, None]],
+        status_byte: int | None,
+        payload: bytes,
+    ) -> None:
+        """Run a COS listener in a separate task with error handling."""
+        try:
+            await listener(status_byte, payload)
+        except Exception as e:
+            logger.error(f"Error in COS listener: {e}")
+
+    def stop_background_reader(self) -> None:
+        """Stop background reader task."""
+        if self._reader_task:
+            self._reader_task.cancel()
+            self._reader_task = None
 
     # ========================================================================
     # Low-level communication
@@ -584,49 +609,6 @@ class AritechClient:
         """Register a callback for COS (Change of Status) events."""
         self._event_listeners.append(callback)
 
-    def _check_for_cos_event(self, frame: bytes) -> bool:
-        """
-        Check if a frame is a COS event and queue it for processing.
-
-        COS events have format: [0xC0 header][0xCA 0x00 msgId 37][payload...]
-        Returns True if this was a COS event.
-        """
-        if not self._monitoring_active or not self._session_key:
-            logger.debug(f"_check_for_cos_event: skipped (active={self._monitoring_active}, key={self._session_key is not None})")
-            return False
-
-        try:
-            decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
-            if not decrypted or len(decrypted) < 3:
-                logger.debug(f"_check_for_cos_event: decrypt failed or too short")
-                return False
-
-            logger.debug(f"_check_for_cos_event: checking bytes {decrypted[0]:02x} {decrypted[1]:02x} {decrypted[2]:02x}")
-
-            # Check for Message ID 37 (COS notification)
-            # Format: [0xC0 header][0xCA 0x00 varint msgId 37][payload...]
-            if decrypted[0] == 0xC0 and decrypted[1] == 0xCA and decrypted[2] == 0x00:
-                payload = decrypted[3:]
-                status_byte = payload[2] if len(payload) >= 3 else None
-
-                status_str = f"0x{status_byte:02x}" if status_byte is not None else "??"
-                logger.debug(f"COS Event DETECTED - status: {status_str}")
-                logger.debug(f"COS payload: {payload.hex()}")
-                logger.debug(f"Number of listeners: {len(self._event_listeners)}")
-
-                # Queue the event for processing (will be processed after releasing the lock)
-                self._cos_event_queue.append((status_byte, payload))
-
-                return True
-            else:
-                logger.debug(f"_check_for_cos_event: not a COS event (pattern mismatch)")
-        except Exception as e:
-            # Ignore decryption errors for non-COS frames
-            logger.debug(f"_check_for_cos_event: exception {e}")
-            pass
-
-        return False
-
     async def _send_raw(self, data: bytes) -> None:
         """Send raw bytes."""
         if not self._writer:
@@ -635,10 +617,32 @@ class AritechClient:
         await self._writer.drain()
 
     async def _receive_frame(self, timeout: float = 5.0) -> bytes:
-        """Receive a SLIP frame, handling COS events."""
+        """Receive a SLIP frame."""
         if not self._reader:
             raise AritechError("Not connected", code=ErrorCode.CONNECTION_FAILED)
 
+        # If background reader is active, wait for it to deliver the response
+        if self._monitoring_active and self._reader_task:
+            return await self._receive_frame_via_reader(timeout)
+
+        # Otherwise read directly (used during initialization before monitoring starts)
+        return await self._receive_frame_direct(timeout)
+
+    async def _receive_frame_via_reader(self, timeout: float) -> bytes:
+        """Wait for background reader to deliver a response frame."""
+        # Create a future for the background reader to resolve
+        self._pending_response = asyncio.get_event_loop().create_future()
+
+        try:
+            frame = await asyncio.wait_for(self._pending_response, timeout=timeout)
+            return frame
+        except asyncio.TimeoutError:
+            raise AritechError("Receive timeout", code=ErrorCode.TIMEOUT)
+        finally:
+            self._pending_response = None
+
+    async def _receive_frame_direct(self, timeout: float) -> bytes:
+        """Read a SLIP frame directly (when monitoring not active)."""
         end_time = asyncio.get_event_loop().time() + timeout
 
         while True:
@@ -651,11 +655,6 @@ class AritechClient:
                 if end > start:
                     frame = bytes(self._receive_buffer[: end + 1])
                     del self._receive_buffer[: end + 1]
-
-                    # Check for COS event first - if it is, keep reading
-                    if self._check_for_cos_event(frame):
-                        continue
-
                     return frame
                 del self._receive_buffer[: end + 1]
 
@@ -665,15 +664,16 @@ class AritechClient:
 
             try:
                 data = await asyncio.wait_for(
-                    self._reader.read(1024), timeout=remaining
+                    self._reader.read(1024), timeout=min(remaining, 0.5)
                 )
                 if not data:
                     raise AritechError(
                         "Connection closed", code=ErrorCode.CONNECTION_FAILED
                     )
                 self._receive_buffer.extend(data)
-            except asyncio.TimeoutError as e:
-                raise AritechError("Receive timeout", code=ErrorCode.TIMEOUT) from e
+            except asyncio.TimeoutError:
+                if asyncio.get_event_loop().time() >= end_time:
+                    raise AritechError("Receive timeout", code=ErrorCode.TIMEOUT)
 
     async def send_encrypted(self, payload: bytes, key: bytes | None = None) -> None:
         """Send an encrypted message without waiting for response."""
@@ -720,6 +720,8 @@ class AritechClient:
         logger.debug(f"TX (enc): {frame.hex()}")
         await self._send_raw(frame)
 
+        # If monitoring active, bg reader will deliver response via Future
+        # Otherwise we read directly
         response = await self._receive_frame()
         logger.debug(f"RX (enc): {response.hex()}")
 
@@ -754,7 +756,8 @@ class AritechClient:
         """
         Public method to send encrypted message and receive response.
 
-        Used by AritechMonitor for COS handling.
+        Used by AritechMonitor for COS handling. This delegates to the internal
+        method which handles pausing the background reader.
         """
         return await self._call_encrypted(payload, key, raise_on_error)
 
