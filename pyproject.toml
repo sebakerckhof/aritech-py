@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aritech-client"
-version = "0.2.2"
+version = "0.2.3"
 description = "Unofficial Python client library for ATS alarm panels"
 readme = "README.md"
 license = "MIT"
