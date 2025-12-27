@@ -49,7 +49,7 @@ from .protocol import (
 )
 from .state import AreaState, OutputState, TriggerState, ZoneState
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 __all__ = [
     # Version

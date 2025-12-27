@@ -6,7 +6,12 @@ An unofficial, community-developed async Python client to monitor and control AT
 
 ## Compatibility
 
-This library supports the ACE 2 ATS version 6 protocol, which works with Advisor Advanced panels (ATS1500A, ATS3500A, ATS4500A series). The older version 4 protocol for Master/Classic panels is not supported.
+This library supports the ACE 2 ATS version 6 protocol, which works with Advisor Advanced panels:
+
+- **x500 panels**: ATS1500A, ATS2000A, ATS3500A, ATS4500A (PIN-based login, AES-192)
+- **x700 panels**: ATS1500A-IP-MM, ATS3500A-IP-MM, ATS4500A-IP-MM (username/password login, AES-256)
+
+The older version 4 protocol for Master/Classic panels is not supported.
 
 Note that protocol behavior may vary based on panel firmware version. This library has been tested with a limited set of panels. If you encounter issues, please mention your panel model and firmware version when reporting.
 
@@ -30,16 +35,36 @@ pip install -e .
 
 ## Configuration
 
-Create a `config.json` in the current directory or `~/.aritech/config.json`:
+Create a `config.json` in the current directory or `~/.aritech/config.json` based on your panel type:
+
+**For x500 panels (ATS1500A, ATS2000A, ATS3500A, ATS4500A):**
+
+Copy `config.x500.json.example` to `config.json` and edit with your settings:
 
 ```json
 {
   "host": "192.168.1.100",
   "port": 3001,
   "pin": "1234",
-  "encryptionPassword": "your-24-char-password!!"
+  "encryptionKey": "your-24-char-encryption-key"
 }
 ```
+
+**For x700 panels (ATS1500A-IP-MM, ATS3500A-IP-MM, ATS4500A-IP-MM):**
+
+Copy `config.x700.json.example` to `config.json` and edit with your settings:
+
+```json
+{
+  "host": "192.168.1.100",
+  "port": 3001,
+  "username": "ADMIN",
+  "password": "SECRET",
+  "encryptionKey": "your-48-char-encryption-key"
+}
+```
+
+Note: x700 panels use AES-256 (48-char key) while x500 panels use AES-192 (24-char key).
 
 ## CLI Usage
 
@@ -86,14 +111,21 @@ Available commands:
   aritech-cli event-log [count]            - Read event log (default: 50 events)
 
 Configuration options (override config.json):
-  --host <ip>          - Panel IP address
-  --port <port>        - Panel port number
-  --pin <pin>          - User PIN code
-  --password <pwd>     - Encryption password
-  --config <path>      - Path to config.json
+  --host <ip>              - Panel IP address
+  --port <port>            - Panel port number
+  --encryptionKey <key>    - Encryption key (24-48 chars)
+  --config <path>          - Path to config.json
+
+  x500 panels:
+  --pin <pin>              - User PIN code
+
+  x700 panels:
+  --username <user>        - Login username
+  --password <pwd>         - Login password (defaults to username)
 
 Examples:
-  aritech-cli --host 192.168.1.100 --pin 1234 --password "mypassword12345678901234" zones
+  aritech-cli --host 192.168.1.100 --pin 1234 --encryptionKey <key> zones
+  aritech-cli --host 192.168.1.100 --username ADMIN --password SECRET --encryptionKey <key> zones
   aritech-cli arm 1 full             - Full arm area 1
   aritech-cli arm 1 part1            - Part arm 1 (set 1)
   aritech-cli arm 2 part2            - Part arm 2 (set 2)
@@ -118,7 +150,7 @@ async def main():
         host="192.168.1.100",
         port=3001,
         pin="1234",
-        encryption_password="your-24-char-password!!",
+        encryption_key="your-24-char-encryption-key",
     )
 
     async with AritechClient(config) as client:
@@ -153,7 +185,7 @@ async def main():
         host="192.168.1.100",
         port=3001,
         pin="1234",
-        encryption_password="your-24-char-password!!",
+        encryption_key="your-24-char-encryption-key",
     )
 
     async with AritechClient(config) as client:
@@ -183,7 +215,8 @@ asyncio.run(main())
 ### Basic
 - Connect to panel and retrieve panel description
 - Session key exchange
-- Login with PIN code
+- Login with PIN code (x500 panels)
+- Login with username/password (x700 panels)
 - Read event log
 
 ### Areas

@@ -86,23 +86,33 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  aritech-cli --host 192.168.1.100 --pin 1234 zones
-  aritech-cli areas
-  aritech-cli arm 1 full
-  aritech-cli arm 1 part1 --force
-  aritech-cli disarm 1
-  aritech-cli inhibit 12
-  aritech-cli outputs
-  aritech-cli activate 1
-  aritech-cli event-log 50
+  x500 panels (PIN-based):
+    aritech-cli --host 192.168.1.100 --pin 1234 --encryptionKey <key> zones
+
+  x700 panels (username/password):
+    aritech-cli --host 192.168.1.100 --username ADMIN --password SECRET --encryptionKey <key> zones
+
+  Common commands:
+    aritech-cli areas
+    aritech-cli arm 1 full
+    aritech-cli arm 1 part1 --force
+    aritech-cli disarm 1
+    aritech-cli inhibit 12
+    aritech-cli outputs
+    aritech-cli activate 1
+    aritech-cli event-log 50
 """,
     )
 
     # Connection options
     parser.add_argument("--host", help="Panel IP address")
     parser.add_argument("--port", type=int, help="Panel port number")
-    parser.add_argument("--pin", help="User PIN code")
-    parser.add_argument("--password", help="Encryption password (24 chars)")
+    parser.add_argument("--encryptionKey", help="Encryption key (24-48 chars)")
+    # x500 panels
+    parser.add_argument("--pin", help="User PIN code (x500 panels)")
+    # x700 panels
+    parser.add_argument("--username", help="Login username (x700 panels)")
+    parser.add_argument("--password", help="Login password (x700 panels, defaults to username)")
     parser.add_argument("--config", type=Path, help="Path to config.json")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
 
@@ -603,29 +613,36 @@ async def run_command(args: argparse.Namespace) -> int:
     host = args.host or config_data.get("host")
     port = args.port or config_data.get("port", 32000)
     pin = args.pin or config_data.get("pin")
-    password = args.password or config_data.get("encryptionPassword") or config_data.get("password")
+    username = args.username or config_data.get("username")
+    password = args.password or config_data.get("password") or ""
+    encryption_key = args.encryptionKey or config_data.get("encryptionKey")
 
     # Validate required fields
+    # For x500 panels: host, pin, encryptionKey
+    # For x700 panels: host, username, encryptionKey (password defaults to username)
     missing = []
     if not host:
         missing.append("host")
-    if not pin:
-        missing.append("pin")
-    if not password:
-        missing.append("password")
+    if not pin and not username:
+        missing.append("pin or username")
+    if not encryption_key:
+        missing.append("encryptionKey")
 
     if missing:
         print(f"Error: Missing required configuration: {', '.join(missing)}")
         print("\nProvide via CLI args or config.json:")
-        print("  --host <ip> --pin <pin> --password <24-char-password>")
+        print("  x500: --host <ip> --pin <pin> --encryptionKey <key>")
+        print("  x700: --host <ip> --username <user> --password <pwd> --encryptionKey <key>")
         return 1
 
     # Create client config
     config = AritechConfig(
         host=host,
         port=port,
-        pin=pin,
-        encryption_password=password,
+        pin=pin or "",
+        encryption_key=encryption_key,
+        username=username or "",
+        password=password,
     )
 
     client = AritechClient(config)

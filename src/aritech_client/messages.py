@@ -210,8 +210,9 @@ _register(
     properties={"typeId": [{"byte": 3}]},
 )
 
+# x500 panels: PIN-based login (device.getConnect)
 _register(
-    "login",
+    "loginWithPin",
     msg_id=3,
     msg_id_bytes=[0x06],
     template_bytes=[0x06, 0x0B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -226,6 +227,41 @@ _register(
         "canReadLogs": [{"byte": 9}],
         "pinCode": [{"byte": 11, "length": 10}],
         "connectionMethod": [{"byte": 22}],
+    },
+)
+
+# x700 panels: Username/password login (device.getLogPassConnect)
+# Byte layout: [0x06][0x0f][0x06][typeId][6 permission flags][32-byte username][0x20 len][32-byte password][conn info]
+# The 6th permission (canReadLogs) at templateBytes[9] defaults to 0x20 (enabled)
+_register(
+    "loginWithAccount",
+    msg_id=3,
+    msg_id_bytes=[0x06],
+    template_bytes=[
+        0x06, 0x0F, 0x06,  # templateBytes 0-2: sub-type markers
+        0x00,              # templateBytes 3: typeId
+        0x00, 0x00, 0x00, 0x00, 0x00,  # templateBytes 4-8: 5 permission flags
+        0x20,              # templateBytes 9: canReadLogs (default 0x20 = enabled)
+        *([0x00] * 32),    # templateBytes 10-41: username (32 bytes, null-padded)
+        0x20,              # templateBytes 42: password length marker (0x20 = 32)
+        *([0x00] * 32),    # templateBytes 43-74: password (32 bytes, null-padded)
+        0x00, 0x00, 0x00,  # templateBytes 75-77: connMethod, connMethodExt, RFU
+    ],
+    payload_length=79,
+    properties={
+        # Byte offsets match JS: buffer[byteOffset + 1] = templateBytes[byteOffset - 1]
+        "typeId": [{"byte": 4}],
+        "canUpload": [{"byte": 5}],
+        "canDownload": [{"byte": 6}],
+        "canControl": [{"byte": 7}],
+        "canMonitor": [{"byte": 8}],
+        "canDiagnose": [{"byte": 9}],
+        "canReadLogs": [{"byte": 10}],  # templateBytes[9] - defaults to 0x20
+        "username": [{"byte": 11, "length": 32}],
+        "password": [{"byte": 44, "length": 32}],
+        "connectionMethod": [{"byte": 76}],
+        "connectionMethodExtended": [{"byte": 77}],
+        "reservedForFutureUse": [{"byte": 78}],
     },
 )
 

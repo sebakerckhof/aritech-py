@@ -12,6 +12,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 from .errors import AritechError, ErrorCode
 from .message_helpers import (
     HEADER_ERROR,
+    HEADER_REQUEST,
     HEADER_RESPONSE,
     build_batch_stat_request,
     build_get_event_log_message,
@@ -58,13 +60,19 @@ def _debug_enabled() -> bool:
 
 @dataclass(slots=True)
 class AritechConfig:
-    """Configuration for AritechClient."""
+    """Configuration for AritechClient.
+
+    For x500 panels: use pin
+    For x700 panels: use username (password defaults to username if not set)
+    """
 
     host: str
     port: int = 3001
     pin: str = ""
-    encryption_password: str = ""
+    encryption_key: str = ""
     serial: str | None = None
+    username: str = ""
+    password: str = ""  # Defaults to username if not set
 
 
 @dataclass(slots=True)
@@ -158,8 +166,8 @@ class AritechClient:
                 host=config.get("host", ""),
                 port=config.get("port", 3001),
                 pin=config.get("pin", ""),
-                encryption_password=config.get(
-                    "encryption_password", config.get("encryptionPassword", "")
+                encryption_key=config.get(
+                    "encryption_key", config.get("encryptionKey", "")
                 ),
                 serial=config.get("serial"),
             )
@@ -175,7 +183,7 @@ class AritechClient:
         self._event_listeners: list[Callable[[bytes], Coroutine[Any, Any, None]]] = []
 
         # Encryption keys
-        self._initial_key = make_encryption_key(self.config.encryption_password)
+        self._initial_key = make_encryption_key(self.config.encryption_key)
         self._serial_bytes: bytes | None = None
         self._session_key: bytes | None = None
 
@@ -193,17 +201,24 @@ class AritechClient:
 
         # Keep-alive task
         self._keepalive_task: asyncio.Task[None] | None = None
+        self._keepalive_failures: int = 0
+        self._max_keepalive_failures: int = 3  # Trigger connection lost after 3 failures
+
+        # Connection lost callbacks
+        self._on_connection_lost: list[Callable[[], Coroutine[Any, Any, None] | None]] = []
 
         # Background reader task - single reader that fans out messages
         self._reader_task: asyncio.Task[None] | None = None
         # Pending response future - commands wait on this for their response
         self._pending_response: asyncio.Future[bytes] | None = None
-
         # Command queue lock - ensures control operations are serialized
         # This prevents conflicts when:
         # 1. The same entity can only have one active control session
         # 2. Requests don't have unique IDs, so responses must be sequential
         self._command_lock: asyncio.Lock = asyncio.Lock()
+        self._command_lock_depth: ContextVar[int] = ContextVar(
+            "aritech_command_lock_depth", default=0
+        )
 
     @property
     def panel_model(self) -> str | None:
@@ -383,11 +398,21 @@ class AritechClient:
         logger.debug("Key exchange complete")
 
     async def _login(self) -> None:
-        """Login with PIN."""
+        """Login - auto-selects method based on config.
+
+        Uses loginWithAccount if username is configured, otherwise loginWithPin.
+        """
+        if self.config.username:
+            await self._login_with_account()
+        else:
+            await self._login_with_pin()
+
+    async def _login_with_pin(self) -> None:
+        """Login with PIN (x500 panels)."""
         logger.debug(f"Logging in with PIN: {self.config.pin}")
 
         login_payload = construct_message(
-            "login",
+            "loginWithPin",
             {
                 "canUpload": True,
                 "canDownload": False,
@@ -422,10 +447,56 @@ class AritechClient:
             status=status_code,
         )
 
+    async def _login_with_account(self) -> None:
+        """Login with username/password (x700 panels)."""
+        logger.debug(f"Logging in with username: {self.config.username}")
+
+        # Default password to username if not set
+        password = self.config.password or self.config.username
+
+        login_payload = construct_message(
+            "loginWithAccount",
+            {
+                "canUpload": True,
+                "canDownload": False,
+                "canControl": True,
+                "canMonitor": True,
+                "canDiagnose": False,
+                "canReadLogs": False,
+                "username": self.config.username,
+                "password": password,
+                "connectionMethod": 1,  # TCP/IP
+            },
+        )
+
+        response = await self._call_encrypted(login_payload, self._session_key)
+        if not response:
+            raise AritechError("Login failed - no response", code=ErrorCode.LOGIN_FAILED)
+
+        # Check response: a0 00 00 means success (header + msgId 0 + status 0)
+        if (
+            len(response) >= 3
+            and response[0] == HEADER_RESPONSE
+            and response[2] == 0x00
+        ):
+            logger.debug("Login successful")
+            self._start_keepalive()
+            return
+
+        # Login failed
+        status_code = response[2] if len(response) >= 3 else 0xFF
+        raise AritechError(
+            f"Login failed - status code 0x{status_code:02x}",
+            code=ErrorCode.LOGIN_FAILED,
+            status=status_code,
+        )
+
     def _start_keepalive(self) -> None:
         """Start keep-alive task."""
         if self._keepalive_task:
             return
+
+        self._keepalive_failures = 0
 
         async def keepalive() -> None:
             while True:
@@ -434,15 +505,27 @@ class AritechClient:
                     if self._session_key and self._writer:
                         msg = construct_message("ping", {})
                         await self._call_encrypted(msg, self._session_key)
+                        # Successful ping, reset failure counter
+                        self._keepalive_failures = 0
                     else:
                         # No session/writer, stop keepalive
+                        logger.debug("Keep-alive stopping: no session/writer")
+                        await self._emit_connection_lost()
                         break
                 except asyncio.CancelledError:
                     # Task was cancelled, exit cleanly
                     break
                 except Exception as e:
-                    # Log error but continue - don't break on transient errors
-                    logger.debug(f"Keep-alive failed: {e}")
+                    self._keepalive_failures += 1
+                    logger.warning(
+                        f"Keep-alive failed ({self._keepalive_failures}/{self._max_keepalive_failures}): {e}"
+                    )
+                    if self._keepalive_failures >= self._max_keepalive_failures:
+                        logger.error(
+                            f"Connection lost: {self._keepalive_failures} consecutive keep-alive failures"
+                        )
+                        await self._emit_connection_lost()
+                        break
 
         self._keepalive_task = asyncio.create_task(keepalive())
 
@@ -477,10 +560,10 @@ class AritechClient:
                     frame_count += 1
                     logger.debug(f"Background reader got frame #{frame_count}: {len(frame)} bytes")
 
-                    # Check if it's a COS event
-                    if self._is_cos_event(frame):
-                        logger.debug("  -> COS event, processing...")
-                        await self._handle_cos_frame(frame)
+                    # Check if it's an unsolicited message (COS or other panel notification)
+                    if self._is_unsolicited_message(frame):
+                        logger.debug("  -> Unsolicited message, processing...")
+                        await self._handle_unsolicited_frame(frame)
                     else:
                         # It's a command response - deliver to waiting command
                         logger.debug("  -> Command response")
@@ -539,38 +622,69 @@ class AritechClient:
                     raise
                 # Short timeout for responsiveness, continue
 
-    def _is_cos_event(self, frame: bytes) -> bool:
-        """Check if frame is a COS event (without queueing it)."""
+    def _is_unsolicited_message(self, frame: bytes) -> bool:
+        """
+        Check if frame is an unsolicited message from the panel.
+
+        Unsolicited messages have header 0xC0 (request from panel to client).
+        Responses have header 0xA0, errors have 0xF0.
+
+        Returns True if the message is unsolicited and should NOT be treated as a response.
+        """
         if not self._session_key:
             return False
 
         try:
             decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
-            if not decrypted or len(decrypted) < 3:
+            if not decrypted or len(decrypted) < 2:
                 return False
 
-            # COS event format: [0xC0 header][0xCA 0x00 msgId 37][payload...]
-            return decrypted[0] == 0xC0 and decrypted[1] == 0xCA and decrypted[2] == 0x00
+            # Check if this is an unsolicited message (header 0xC0 = request from panel)
+            return decrypted[0] == HEADER_REQUEST
         except Exception:
             return False
 
-    async def _handle_cos_frame(self, frame: bytes) -> None:
-        """Process a COS event frame by spawning listener tasks (non-blocking)."""
+    async def _handle_unsolicited_frame(self, frame: bytes) -> None:
+        """
+        Process an unsolicited message from the panel.
+
+        If it's a COS message (0xCA prefix), spawns listener tasks.
+        Otherwise, logs a warning about unhandled unsolicited message.
+        """
         try:
             decrypted = decrypt_message(frame, self._session_key, self._serial_bytes)
-            if not decrypted:
+            if not decrypted or len(decrypted) < 2:
                 return
 
-            payload = decrypted[3:]  # Skip C0 CA 00
-            status_byte = payload[2] if len(payload) >= 3 else None
+            # Check if it's a COS message (0xCA prefix = COS message type)
+            if decrypted[1] == 0xCA:
+                cos_type = decrypted[2] if len(decrypted) >= 3 else 0
+                payload = decrypted[3:]  # Skip C0 CA XX
+                status_byte = payload[2] if len(payload) >= 3 else None
 
-            # Spawn listener tasks - don't await them!
-            # This prevents deadlock: listeners may send commands that need
-            # responses from the background reader, so we can't block here.
-            for listener in self._event_listeners:
-                asyncio.create_task(self._run_cos_listener(listener, status_byte, payload))
+                status_val = status_byte if status_byte is not None else 0
+                logger.debug(
+                    f"COS event received: type=0x{cos_type:02x}, "
+                    f"status=0x{status_val:02x}"
+                )
+
+                # Spawn listener tasks - don't await them!
+                # This prevents deadlock: listeners may send commands that need
+                # responses from the background reader, so we can't block here.
+                for listener in self._event_listeners:
+                    asyncio.create_task(
+                        self._run_cos_listener(listener, status_byte, payload)
+                    )
+            else:
+                # Unsolicited message but not a COS - log it
+                msg_id_byte = decrypted[1]
+                logger.warning(
+                    f"Received unsolicited message from panel (no handler): "
+                    f"msgId=0x{msg_id_byte:02x}, data={decrypted.hex()}"
+                )
+
         except Exception as e:
-            logger.error(f"Error handling COS frame: {e}")
+            logger.error(f"Error handling unsolicited frame: {e}")
 
     async def _run_cos_listener(
         self,
@@ -589,6 +703,26 @@ class AritechClient:
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
+
+    @asynccontextmanager
+    async def _with_command_lock(self) -> AsyncIterator[None]:
+        """Re-entrant lock guard to serialize command traffic."""
+        depth = self._command_lock_depth.get()
+        if depth > 0:
+            token = self._command_lock_depth.set(depth + 1)
+            try:
+                yield
+            finally:
+                self._command_lock_depth.reset(token)
+            return
+
+        await self._command_lock.acquire()
+        token = self._command_lock_depth.set(1)
+        try:
+            yield
+        finally:
+            self._command_lock_depth.reset(token)
+            self._command_lock.release()
 
     # ========================================================================
     # Low-level communication
@@ -615,6 +749,26 @@ class AritechClient:
         """Register a callback for COS (Change of Status) events."""
         self._event_listeners.append(callback)
 
+    def on_connection_lost(
+        self, callback: Callable[[], Coroutine[Any, Any, None] | None]
+    ) -> None:
+        """Register a callback for connection lost events.
+
+        Called when the client detects the connection has been lost
+        (e.g., after multiple consecutive keep-alive failures).
+        """
+        self._on_connection_lost.append(callback)
+
+    async def _emit_connection_lost(self) -> None:
+        """Emit connection lost event to all registered callbacks."""
+        for callback in self._on_connection_lost:
+            try:
+                result = callback()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"Error in connection lost callback: {e}")
+
     async def _send_raw(self, data: bytes) -> None:
         """Send raw bytes."""
         if not self._writer:
@@ -636,8 +790,9 @@ class AritechClient:
 
     async def _receive_frame_via_reader(self, timeout: float) -> bytes:
         """Wait for background reader to deliver a response frame."""
-        # Create a future for the background reader to resolve
-        self._pending_response = asyncio.get_event_loop().create_future()
+        # Future should be created by caller before sending
+        if not self._pending_response:
+            raise AritechError("No pending response future", code=ErrorCode.PROTOCOL_ERROR)
 
         try:
             frame = await asyncio.wait_for(self._pending_response, timeout=timeout)
@@ -691,18 +846,20 @@ class AritechClient:
         encrypted = encrypt_message(payload, key, self._serial_bytes)
         frame = slip_encode(encrypted)
 
-        logger.debug(f"TX (enc, no-wait): {frame.hex()}")
-        await self._send_raw(frame)
+        async with self._with_command_lock():
+            logger.debug(f"TX (enc, no-wait): {frame.hex()}")
+            await self._send_raw(frame)
 
     async def _call_plain(self, payload: bytes) -> bytes:
         """Send unencrypted message and receive response."""
         with_crc = append_crc(payload)
         frame = slip_encode(with_crc)
 
-        logger.debug(f"TX (plain): {frame.hex()}")
-        await self._send_raw(frame)
+        async with self._with_command_lock():
+            logger.debug(f"TX (plain): {frame.hex()}")
+            await self._send_raw(frame)
 
-        response = await self._receive_frame()
+            response = await self._receive_frame()
         logger.debug(f"RX (plain): {response.hex()}")
 
         decoded = slip_decode(response)
@@ -723,12 +880,20 @@ class AritechClient:
         encrypted = encrypt_message(payload, key, self._serial_bytes)
         frame = slip_encode(encrypted)
 
-        logger.debug(f"TX (enc): {frame.hex()}")
-        await self._send_raw(frame)
+        async with self._with_command_lock():
+            # If monitoring active, bg reader will deliver response via Future
+            if self._monitoring_active and self._reader_task:
+                self._pending_response = asyncio.get_running_loop().create_future()
+            try:
+                logger.debug(f"TX (enc): {frame.hex()}")
+                await self._send_raw(frame)
 
-        # If monitoring active, bg reader will deliver response via Future
-        # Otherwise we read directly
-        response = await self._receive_frame()
+                # Otherwise we read directly
+                response = await self._receive_frame()
+            except Exception:
+                if self._pending_response and not self._pending_response.done():
+                    self._pending_response = None
+                raise
         logger.debug(f"RX (enc): {response.hex()}")
 
         decrypted = decrypt_message(response, key, self._serial_bytes)
@@ -898,7 +1063,7 @@ class AritechClient:
         Raises:
             AritechError: If session creation fails
         """
-        async with self._command_lock:
+        async with self._with_command_lock():
             create_payload = construct_message(create_msg_name, create_props)
             response = await self._call_encrypted(create_payload, self._session_key)
 
@@ -1485,7 +1650,7 @@ class AritechClient:
             set_type: Arm type ('full', 'part1', 'part2')
             force: Force arm despite faults
         """
-        async with self._command_lock:
+        async with self._with_command_lock():
             await self._arm_area_impl(areas, set_type, force)
 
     async def _arm_area_impl(
@@ -1750,7 +1915,7 @@ class AritechClient:
 
     async def disarm_area(self, area_num: int) -> None:
         """Disarm an area."""
-        async with self._command_lock:
+        async with self._with_command_lock():
             await self._disarm_area_impl(area_num)
 
     async def _disarm_area_impl(self, area_num: int) -> None:

@@ -4,20 +4,77 @@ Protocol utilities for ATS panel communication.
 This module provides low-level utilities for:
 - SLIP framing (RFC 1055)
 - CRC-16 checksums
-- AES-128-CTR encryption
+- AES-CTR encryption (128, 192, or 256 bit keys)
 - Key derivation and serial number decoding
+
+Protocol details:
+- AES-CTR encryption (128, 192, or 256 bit keys)
+- Frame structure: [8-byte nonce][encrypted payload + CRC]
+- IV = [nonce 8 bytes][serial 6 bytes][padding 2 bytes]
+- CRC-16 polynomial 0xA001, init 0xFFFF, big-endian
 """
 
 from __future__ import annotations
 
 import os
 import re
+from enum import IntEnum
 from typing import TYPE_CHECKING
 
 from Crypto.Cipher import AES
 
 if TYPE_CHECKING:
     pass
+
+
+# ============================================================================
+# ENCRYPTION MODE CONSTANTS
+# ============================================================================
+
+
+class EncryptionMode(IntEnum):
+    """Encryption modes supported by the panel."""
+
+    NONE = 0
+    AES_128 = 1
+    AES_192 = 2  # Note: Panel may report this as AES_256
+    AES_256 = 2  # Panel reports 2 for AES-256
+
+
+def get_password_length(mode: EncryptionMode) -> int:
+    """
+    Get the required password length for an encryption mode.
+
+    Args:
+        mode: Encryption mode
+
+    Returns:
+        Required password length (24, 36, or 48 chars)
+    """
+    if mode == EncryptionMode.AES_128:
+        return 24
+    elif mode in (EncryptionMode.AES_192, EncryptionMode.AES_256):
+        return 48  # AES-256 needs 48 chars
+    return 24
+
+
+def get_aes_key_size(mode: EncryptionMode) -> int:
+    """
+    Get the AES key size in bytes for an encryption mode.
+
+    Args:
+        mode: Encryption mode
+
+    Returns:
+        Key size in bytes (16, 24, or 32)
+    """
+    if mode == EncryptionMode.AES_128:
+        return 16
+    elif mode == EncryptionMode.AES_192:
+        return 24
+    elif mode == EncryptionMode.AES_256:
+        return 32
+    return 16
 
 # SLIP framing constants (RFC 1055)
 SLIP_END = 0xC0
@@ -145,21 +202,29 @@ def _gray_pack(value: int) -> int:
 
 def make_encryption_key(password: str) -> bytes:
     """
-    Derive 16-byte AES key from 24-character password.
+    Derive encryption key from password.
+
+    Password length determines key size:
+    - 24 chars (2 parts × 12) → 16-byte key (AES-128)
+    - 36 chars (3 parts × 12) → 24-byte key (AES-192)
+    - 48 chars (4 parts × 12) → 32-byte key (AES-256)
 
     Args:
-        password: 24-character hex password string
+        password: Encryption password (24, 36, or 48 characters)
 
     Returns:
-        16-byte encryption key
+        Encryption key (16, 24, or 32 bytes)
     """
     if not password or len(password) < 24:
         return bytes(16)
 
-    result = bytearray(16)
-    parts = [password[0:12], password[12:24]]
+    # Determine number of 12-character parts based on password length
+    num_parts = min(len(password) // 12, 4)
+    key_size = num_parts * 8  # 8 bytes per part
+    result = bytearray(key_size)
 
-    for part_index, part in enumerate(parts):
+    for part_index in range(num_parts):
+        part = password[part_index * 12 : (part_index + 1) * 12]
         chars = part.encode("ascii")
         offset = part_index * 8
 
@@ -228,19 +293,28 @@ def decode_serial(serial: str) -> bytes:
 
 def aes_ctr(data: bytes, key: bytes, nonce: bytes, serial_bytes: bytes) -> bytes:
     """
-    AES-128-CTR encryption/decryption.
+    AES-CTR encryption/decryption.
+
+    Supports AES-128, AES-192, and AES-256 based on key size.
 
     IV = [nonce 8 bytes][serial 6 bytes][padding 2 bytes]
 
     Args:
         data: Data to encrypt/decrypt
-        key: 16-byte AES key
+        key: Encryption key (16, 24, or 32 bytes for AES-128/192/256)
         nonce: 8-byte nonce
         serial_bytes: 6-byte serial
 
     Returns:
         Encrypted/decrypted data
+
+    Raises:
+        ValueError: If key size is not 16, 24, or 32 bytes
     """
+    if len(key) not in (16, 24, 32):
+        raise ValueError(
+            f"Invalid AES key size: {len(key)}. Must be 16, 24, or 32 bytes."
+        )
     # IV = [nonce 8 bytes][serial 6 bytes][padding 2 bytes]
     iv = bytearray(16)
     iv[0:8] = nonce[0:8]
@@ -290,7 +364,7 @@ def encrypt_message(payload: bytes, key: bytes, serial_bytes: bytes) -> bytes:
 
     Args:
         payload: Message payload to encrypt
-        key: 16-byte encryption key
+        key: Encryption key (16, 24, or 32 bytes for AES-128/192/256)
         serial_bytes: 6-byte decoded serial
 
     Returns:
@@ -310,7 +384,7 @@ def decrypt_message(frame: bytes, key: bytes, serial_bytes: bytes) -> bytes | No
 
     Args:
         frame: SLIP-encoded frame to decrypt
-        key: 16-byte encryption key
+        key: Encryption key (16, 24, or 32 bytes for AES-128/192/256)
         serial_bytes: 6-byte decoded serial
 
     Returns:
