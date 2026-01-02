@@ -165,6 +165,18 @@ for name, msg_id, msg_id_bytes, payload_len in [
         properties=props,
     )
 
+# Door control session (no area properties needed - uses empty props)
+_register(
+    "createDoorControlSession",
+    msg_id=1382,
+    msg_id_bytes=[0xCC, 0x15],
+    template_bytes=[0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    payload_length=12,
+    properties={
+        "typeId": [{"byte": 3}],
+    },
+)
+
 _register(
     "destroyControlSession",
     msg_id=-39,
@@ -362,6 +374,46 @@ for name, msg_id, msg_id_bytes, payload_len in [
         },
     )
 
+# Door control commands
+# Format from capture: c0cfe621 02 SSSS OOOO 00000000
+# byte 3: typeId, bytes 4-5: sessionId, bytes 6-7: objectId (big-endian), bytes 8-11: padding
+for name, msg_id, msg_id_bytes in [
+    ("lockDoor", -276840, [0xCF, 0xE5, 0x21]),
+    ("unlockDoor", -276904, [0xCF, 0xE6, 0x21]),
+    ("unlockDoorStandardTime", -276712, [0xCF, 0xE3, 0x21]),
+    ("disableDoor", -276968, [0xCF, 0xE7, 0x21]),
+    ("enableDoor", -277032, [0xCF, 0xE8, 0x21]),
+]:
+    _register(
+        name,
+        msg_id=msg_id,
+        msg_id_bytes=msg_id_bytes,
+        template_bytes=[0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        payload_length=12,
+        properties={
+            "typeId": [{"byte": 3}],
+            "sessionId": [{"byte": 4}, {"byte": 5}],
+            # objectId is big-endian: write high byte first (byte 7), then low byte (byte 6)
+            "objectId": [{"byte": 7}, {"byte": 6}],
+        },
+    )
+
+# Door unlock with custom time
+_register(
+    "unlockDoorTime",
+    msg_id=-276776,
+    msg_id_bytes=[0xCF, 0xE4, 0x21],
+    template_bytes=[0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    payload_length=13,
+    properties={
+        "typeId": [{"byte": 3}],
+        "sessionId": [{"byte": 4}, {"byte": 5}],
+        # objectId is big-endian: write high byte first (byte 7), then low byte (byte 6)
+        "objectId": [{"byte": 7}, {"byte": 6}],
+        "timeOpen": [{"byte": 8}],
+    },
+)
+
 # Query messages
 _register(
     "getZonesAssignedToAreas",
@@ -389,6 +441,7 @@ _register(
 # Change-of-state queries
 for name, msg_id, msg_id_bytes in [
     ("getAreaChanges", 165, [0xCA, 0x02]),
+    ("getDoorChanges", 741, [0xCA, 0x0B]),
     ("getOutputChanges", 485, [0xCA, 0x07]),
     ("getTriggerChanges", 1317, [0xCA, 0x14]),
     ("getZoneChanges", 101, [0xCA, 0x01]),
@@ -405,6 +458,7 @@ for name, msg_id, msg_id_bytes in [
 # Status queries
 for name, msg_id, msg_id_bytes in [
     ("getAreaStatus", -166, [0xCB, 0x02]),
+    ("getDoorStatus", -742, [0xCB, 0x0B]),
     ("getOutputStatus", -486, [0xCB, 0x07]),
     ("getTriggerStatus", -1318, [0xCB, 0x14]),
     ("getZoneStatus", -102, [0xCB, 0x01]),
@@ -431,6 +485,15 @@ _register(
 )
 
 _register(
+    "getValidDoors",
+    msg_id=13,
+    msg_id_bytes=[0x1A],
+    template_bytes=[0x0B, 0x00, 0x00],
+    payload_length=4,
+    properties={"typeId": [{"byte": 3}]},
+)
+
+_register(
     "getControlSessionStatus",
     msg_id=39,
     msg_id_bytes=[0xCE, 0x00],
@@ -445,6 +508,7 @@ _register(
 # Name queries
 for name, type_byte in [
     ("getAreaNames", 0x02),
+    ("getDoorNames", 0x0B),
     ("getOutputNames", 0x07),
     ("getTriggerNames", 0x14),
     ("getZoneNames", 0x01),
@@ -490,6 +554,7 @@ _register(
 # Name responses
 for name, type_byte in [
     ("areaNames", 0x02),
+    ("doorNames", 0x0B),
     ("outputNames", 0x07),
     ("triggerNames", 0x14),
     ("zoneNames", 0x01),
@@ -639,6 +704,34 @@ _register(
         "isInSoakTest": [{"byte": 5, "mask": 0x04}],
         "isSet": [{"byte": 5, "mask": 0x08}],
         "isAlarming": [{"byte": 5, "mask": 0x10}],
+    },
+)
+
+_register(
+    "doorStatus",
+    msg_id=-25,
+    msg_id_bytes=[0x31],
+    template_bytes=[0x0B, 0x00, 0x00, 0x00, 0x00],
+    payload_length=6,
+    properties={
+        "objectId": [{"byte": 3}],
+        # Byte 4 flags
+        "isDisabled": [{"byte": 4, "mask": 0x01}],
+        "isUnlocked": [{"byte": 4, "mask": 0x02}],
+        "isUnlockedPeriod": [{"byte": 4, "mask": 0x04}],
+        "isTimeUnlocked": [{"byte": 4, "mask": 0x08}],
+        "isStandardTimeUnlocked": [{"byte": 4, "mask": 0x10}],
+        "isOpened": [{"byte": 4, "mask": 0x20}],
+        "isForced": [{"byte": 4, "mask": 0x40}],
+        "isDoorOpenTooLong": [{"byte": 4, "mask": 0x80}],
+        # Byte 5 flags
+        "isShunting": [{"byte": 5, "mask": 0x01}],
+        "isShuntWarning": [{"byte": 5, "mask": 0x02}],
+        "isReaderFault": [{"byte": 5, "mask": 0x04}],
+        "isReaderTamper": [{"byte": 5, "mask": 0x08}],
+        "isUnsecured": [{"byte": 5, "mask": 0x10}],
+        "isInputActive": [{"byte": 5, "mask": 0x20}],
+        "isOutputActive": [{"byte": 5, "mask": 0x40}],
     },
 )
 

@@ -48,7 +48,7 @@ from .protocol import (
     slip_encode,
     verify_crc,
 )
-from .state import AreaState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
 
 logger = logging.getLogger(__name__)
 
@@ -1837,6 +1837,184 @@ class AritechClient:
                 )
 
             logger.debug(f"Trigger {trigger_num} deactivated")
+
+    # ========================================================================
+    # Door methods
+    # ========================================================================
+
+    async def get_door_names(self) -> list[NamedItem]:
+        """Get door names from the panel."""
+        return await self._get_names("getDoorNames", "doorNames", "Door")
+
+    async def get_valid_door_numbers(self) -> list[int]:
+        """Get valid door numbers from the panel."""
+        logger.debug("Querying valid door numbers...")
+
+        payload = construct_message("getValidDoors", {})
+        response = await self._call_encrypted(payload, self._session_key)
+
+        if not response or len(response) < 4:
+            return []
+
+        # Parse bitmask response - doors are in bytes starting at offset 2
+        valid_doors: list[int] = []
+        for byte_idx in range(2, len(response)):
+            byte_val = response[byte_idx]
+            for bit in range(8):
+                if byte_val & (1 << bit):
+                    door_num = (byte_idx - 2) * 8 + bit + 1
+                    valid_doors.append(door_num)
+
+        logger.debug(f"Found {len(valid_doors)} valid doors: {valid_doors}")
+        return valid_doors
+
+    async def get_door_states(
+        self, door_numbers: list[int] | None = None
+    ) -> list[StateResult]:
+        """Get door states."""
+        if door_numbers is None:
+            door_numbers = list(range(1, 9))
+
+        if not door_numbers:
+            return []
+
+        payload = build_batch_stat_request("DOOR", door_numbers)
+        response = await self._call_encrypted(payload, self._session_key)
+
+        if not response or len(response) < 4:
+            return []
+
+        messages = split_batch_response(response, "doorStatus")
+        results: list[StateResult] = []
+
+        for msg in messages:
+            state = DoorState.from_bytes(msg["bytes"])
+            results.append(
+                StateResult(
+                    number=msg["objectId"],
+                    state=state,
+                    raw_hex=msg["bytes"].hex(),
+                )
+            )
+
+        return results
+
+    async def lock_door(self, door_num: int) -> dict[str, Any]:
+        """Lock a door."""
+        logger.debug(f"Locking door {door_num}...")
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "lockDoor", {"sessionId": session_id, "objectId": door_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            # Door commands return a0000100 for success (boolean 0x00 = no error)
+            # Error responses have 0xF0 header which check_response_error will throw on
+            check_response_error(response)
+            logger.debug(f"Door {door_num} locked")
+
+        return {"skipped": False}
+
+    async def unlock_door(self, door_num: int) -> dict[str, Any]:
+        """Unlock a door indefinitely."""
+        logger.debug(f"Unlocking door {door_num}...")
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "unlockDoor", {"sessionId": session_id, "objectId": door_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            check_response_error(response)
+            logger.debug(f"Door {door_num} unlocked")
+
+        return {"skipped": False}
+
+    async def unlock_door_standard_time(self, door_num: int) -> dict[str, Any]:
+        """Unlock a door for the door's configured standard time."""
+        logger.debug(f"Unlocking door {door_num} (standard time)...")
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "unlockDoorStandardTime", {"sessionId": session_id, "objectId": door_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            check_response_error(response)
+            logger.debug(f"Door {door_num} unlocked (standard time)")
+
+        return {"skipped": False}
+
+    async def unlock_door_time(self, door_num: int, seconds: int) -> dict[str, Any]:
+        """Unlock a door for a specified time."""
+        logger.debug(f"Unlocking door {door_num} for {seconds}s...")
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "unlockDoorTime",
+                {"sessionId": session_id, "objectId": door_num, "timeOpen": seconds},
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            check_response_error(response)
+            logger.debug(f"Door {door_num} unlocked for {seconds}s")
+
+        return {"skipped": False}
+
+    async def disable_door(self, door_num: int) -> dict[str, Any]:
+        """Disable a door."""
+        logger.debug(f"Disabling door {door_num}...")
+
+        # Check current state first
+        states = await self.get_door_states([door_num])
+        if states and states[0].state.is_disabled:
+            logger.debug(f"Door {door_num} is already disabled, skipping")
+            return {"skipped": True, "reason": "already disabled"}
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "disableDoor", {"sessionId": session_id, "objectId": door_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            check_response_error(response)
+            logger.debug(f"Door {door_num} disabled")
+
+        return {"skipped": False}
+
+    async def enable_door(self, door_num: int) -> dict[str, Any]:
+        """Enable a door."""
+        logger.debug(f"Enabling door {door_num}...")
+
+        # Check current state first
+        states = await self.get_door_states([door_num])
+        if states and not states[0].state.is_disabled:
+            logger.debug(f"Door {door_num} is already enabled, skipping")
+            return {"skipped": True, "reason": "already enabled"}
+
+        async with self._with_control_session(
+            "createDoorControlSession", {}, "door", door_num
+        ) as session_id:
+            payload = construct_message(
+                "enableDoor", {"sessionId": session_id, "objectId": door_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            check_response_error(response)
+            logger.debug(f"Door {door_num} enabled")
+
+        return {"skipped": False}
 
     # ========================================================================
     # Arm/Disarm operations

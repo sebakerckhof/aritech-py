@@ -19,6 +19,7 @@ HEADER_ERROR = 0xF0
 # Batch response payload lengths
 BATCH_PAYLOAD_LENGTHS = {
     "areaStatus": 17,
+    "doorStatus": 6,
     "zoneStatus": 7,
     "triggerStatus": 5,
     "outputStatus": 5,
@@ -27,6 +28,7 @@ BATCH_PAYLOAD_LENGTHS = {
 # Status message name mapping
 GET_STAT_MSG_NAMES = {
     "AREA": "areaStatus",
+    "DOOR": "doorStatus",
     "ZONE": "zoneStatus",
     "TRIGGER": "triggerStatus",
     "OUTPUT": "outputStatus",

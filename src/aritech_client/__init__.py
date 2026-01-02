@@ -47,9 +47,9 @@ from .protocol import (
     slip_encode,
     verify_crc,
 )
-from .state import AreaState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     # Version
@@ -102,6 +102,7 @@ __all__ = [
     "verify_crc",
     # State classes
     "AreaState",
+    "DoorState",
     "OutputState",
     "TriggerState",
     "ZoneState",

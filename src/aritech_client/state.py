@@ -285,3 +285,97 @@ class TriggerState:
         if self.is_function_key:
             sources.append("FKey")
         return f"Active ({', '.join(sources)})" if sources else "Inactive"
+
+
+@dataclass(slots=True)
+class DoorState:
+    """Parsed door status."""
+
+    # Byte 4 flags
+    is_disabled: bool = False
+    is_unlocked: bool = False
+    is_unlocked_period: bool = False
+    is_time_unlocked: bool = False
+    is_standard_time_unlocked: bool = False
+    is_opened: bool = False
+    is_forced: bool = False
+    is_door_open_too_long: bool = False
+    # Byte 5 flags
+    is_shunting: bool = False
+    is_shunt_warning: bool = False
+    is_reader_fault: bool = False
+    is_reader_tamper: bool = False
+    is_unsecured: bool = False
+    is_input_active: bool = False
+    is_output_active: bool = False
+    raw_flags: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> DoorState:
+        """Parse door status from response bytes."""
+        state = cls()
+        if not data or len(data) < 6:
+            return state
+
+        state.raw_flags = _get_all_properties("doorStatus", data)
+        for f in fields(state):
+            if f.name != "raw_flags":
+                camel_name = _snake_to_camel(f.name)
+                setattr(state, f.name, state.raw_flags.get(camel_name, False))
+
+        return state
+
+    @property
+    def is_locked(self) -> bool:
+        """Door is locked if not unlocked in any way."""
+        return (
+            not self.is_unlocked
+            and not self.is_unlocked_period
+            and not self.is_time_unlocked
+            and not self.is_standard_time_unlocked
+        )
+
+    def __str__(self) -> str:
+        states = []
+
+        # Lock state
+        if (
+            self.is_unlocked
+            or self.is_standard_time_unlocked
+            or self.is_time_unlocked
+            or self.is_unlocked_period
+        ):
+            states.append("Unlocked")
+        else:
+            states.append("Locked")
+
+        if self.is_unlocked:
+            states.append("FullUnlocked")
+        if self.is_time_unlocked:
+            states.append("TimeUnlocked")
+        if self.is_standard_time_unlocked:
+            states.append("StandardTimeUnlocked")
+        if self.is_unlocked_period:
+            states.append("PeriodUnlocked")
+
+        # Open state
+        if self.is_opened:
+            states.append("Opened")
+
+        # Alarm states
+        if self.is_forced:
+            states.append("Forced")
+        if self.is_door_open_too_long:
+            states.append("OpenTooLong")
+        if self.is_disabled:
+            states.append("Disabled")
+
+        # Fault states
+        if self.is_reader_fault:
+            states.append("ReaderFault")
+        if self.is_reader_tamper:
+            states.append("ReaderTamper")
+        if self.is_unsecured:
+            states.append("Unsecured")
+
+        return ", ".join(states)

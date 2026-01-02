@@ -243,6 +243,13 @@ asyncio.run(main())
 - Monitor change events for triggers
 - Activate / Deactivate triggers
 
+### Doors
+- Read door names
+- Read door states
+- Monitor change events for doors
+- Enable / Disable doors
+- Lock / Unlock doors
+
 ## API Reference
 
 ### AritechClient

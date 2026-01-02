@@ -22,7 +22,7 @@ from typing import Any
 from .client import AritechClient, AritechConfig
 from .errors import AritechError
 from .monitor import AritechMonitor, ChangeEvent, InitializedEvent
-from .state import AreaState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -137,6 +137,9 @@ Examples:
     # triggers
     subparsers.add_parser("triggers", help="Show trigger names and states")
 
+    # doors
+    subparsers.add_parser("doors", help="Show door names and states")
+
     # arm
     arm_parser = subparsers.add_parser("arm", help="Arm an area")
     arm_parser.add_argument("area", type=int, nargs="?", default=1, help="Area number (default: 1)")
@@ -176,6 +179,27 @@ Examples:
     # trigger-deactivate
     trig_deact_parser = subparsers.add_parser("trigger-deactivate", help="Deactivate a trigger")
     trig_deact_parser.add_argument("trigger", type=int, help="Trigger number")
+
+    # door-lock
+    door_lock_parser = subparsers.add_parser("door-lock", help="Lock a door")
+    door_lock_parser.add_argument("door", type=int, help="Door number")
+
+    # door-unlock
+    door_unlock_parser = subparsers.add_parser("door-unlock", help="Unlock a door indefinitely")
+    door_unlock_parser.add_argument("door", type=int, help="Door number")
+
+    # door-unlock-time
+    door_unlock_time_parser = subparsers.add_parser("door-unlock-time", help="Unlock a door for a duration")
+    door_unlock_time_parser.add_argument("door", type=int, help="Door number")
+    door_unlock_time_parser.add_argument("seconds", type=int, nargs="?", help="Duration in seconds (omit for standard time)")
+
+    # door-disable
+    door_disable_parser = subparsers.add_parser("door-disable", help="Disable a door")
+    door_disable_parser.add_argument("door", type=int, help="Door number")
+
+    # door-enable
+    door_enable_parser = subparsers.add_parser("door-enable", help="Enable a door")
+    door_enable_parser.add_argument("door", type=int, help="Door number")
 
     # event-log
     eventlog_parser = subparsers.add_parser("event-log", help="Read event log")
@@ -387,6 +411,68 @@ async def cmd_triggers(client: AritechClient, debug: bool = False) -> None:
         print(f"     State: {state_str}")
 
 
+async def cmd_doors(client: AritechClient, debug: bool = False) -> None:
+    """Show door names and states."""
+    print("\nQuerying door names...")
+    doors = await client.get_door_names()
+    print(f"Found {len(doors)} doors\n")
+
+    if not doors:
+        print("No doors found on this panel.")
+        return
+
+    print("Querying door states...")
+    states = await client.get_door_states([d.number for d in doors])
+    states_by_id = {s.number: s.state for s in states}
+
+    print("\nDoors:")
+    for door in doors:
+        state = states_by_id.get(door.number)
+        if not state:
+            print(f"  \u26ab Door {door.number}: {door.name}")
+            print("     State: unknown")
+            continue
+
+        # Determine icon and description
+        icon = "\u26ab"  # black circle (locked)
+        state_desc = "Locked"
+
+        if state.is_disabled:
+            icon = "\U0001F6AB"  # no entry
+            state_desc = "Disabled"
+        elif state.is_forced:
+            icon = "\U0001F534"  # red circle
+            state_desc = "Forced Open"
+        elif state.is_door_open_too_long:
+            icon = "\U0001F7E1"  # yellow circle
+            state_desc = "Open Too Long"
+        elif state.is_opened:
+            icon = "\U0001F7E2"  # green circle
+            state_desc = "Open"
+        elif state.is_unlocked:
+            icon = "\U0001F513"  # unlocked padlock
+            state_desc = "Unlocked (Indefinite)"
+        elif state.is_time_unlocked or state.is_standard_time_unlocked:
+            icon = "\U0001F513"  # unlocked padlock
+            state_desc = "Unlocked (Timed)"
+        elif state.is_unlocked_period:
+            icon = "\U0001F513"  # unlocked padlock
+            state_desc = "Unlocked (Period)"
+
+        print(f"  {icon} Door {door.number}: {door.name}")
+        print(f"     State: {state_desc}")
+
+        # Show all true flags dynamically
+        active_flags = [
+            f.name for f in dataclasses.fields(state)
+            if getattr(state, f.name) is True and not f.name.startswith("raw")
+        ]
+        print(f"     Flags: {', '.join(active_flags) or 'none'}")
+
+        if debug:
+            print(f"     Raw: {state.raw_flags}")
+
+
 async def cmd_arm(client: AritechClient, area: int, set_type: str, force: bool) -> None:
     """Arm an area."""
     print(f"\nArming area {area} ({set_type}{', force' if force else ''})...")
@@ -477,6 +563,70 @@ async def cmd_trigger_deactivate(client: AritechClient, trigger: int) -> None:
         print(f"\u2717 Failed to deactivate trigger {trigger}: {e}")
 
 
+async def cmd_door_lock(client: AritechClient, door: int) -> None:
+    """Lock a door."""
+    print(f"\nLocking door {door}...")
+    try:
+        await client.lock_door(door)
+        print(f"\u2713 Door {door} locked successfully!")
+    except AritechError as e:
+        print(f"\u2717 Failed to lock door {door}: {e}")
+
+
+async def cmd_door_unlock(client: AritechClient, door: int) -> None:
+    """Unlock a door indefinitely."""
+    print(f"\nUnlocking door {door}...")
+    try:
+        await client.unlock_door(door)
+        print(f"\u2713 Door {door} unlocked successfully!")
+    except AritechError as e:
+        print(f"\u2717 Failed to unlock door {door}: {e}")
+
+
+async def cmd_door_unlock_time(client: AritechClient, door: int, seconds: int | None) -> None:
+    """Unlock a door for a duration."""
+    if seconds is None:
+        print(f"\nUnlocking door {door} (standard time)...")
+        try:
+            await client.unlock_door_standard_time(door)
+            print(f"\u2713 Door {door} unlocked for standard time!")
+        except AritechError as e:
+            print(f"\u2717 Failed to unlock door {door}: {e}")
+    else:
+        print(f"\nUnlocking door {door} for {seconds} seconds...")
+        try:
+            await client.unlock_door_time(door, seconds)
+            print(f"\u2713 Door {door} unlocked for {seconds} seconds!")
+        except AritechError as e:
+            print(f"\u2717 Failed to unlock door {door}: {e}")
+
+
+async def cmd_door_disable(client: AritechClient, door: int) -> None:
+    """Disable a door."""
+    print(f"\nDisabling door {door}...")
+    try:
+        result = await client.disable_door(door)
+        if result == "skipped":
+            print(f"\u2713 Door {door} is already disabled")
+        else:
+            print(f"\u2713 Door {door} disabled successfully!")
+    except AritechError as e:
+        print(f"\u2717 Failed to disable door {door}: {e}")
+
+
+async def cmd_door_enable(client: AritechClient, door: int) -> None:
+    """Enable a door."""
+    print(f"\nEnabling door {door}...")
+    try:
+        result = await client.enable_door(door)
+        if result == "skipped":
+            print(f"\u2713 Door {door} is already enabled")
+        else:
+            print(f"\u2713 Door {door} enabled successfully!")
+    except AritechError as e:
+        print(f"\u2717 Failed to enable door {door}: {e}")
+
+
 async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
     """Start monitoring mode."""
     monitor = AritechMonitor(client)
@@ -486,7 +636,8 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
         print(f"  Zones: {len(event.zones)} tracked")
         print(f"  Areas: {len(event.areas)} tracked")
         print(f"  Outputs: {len(event.outputs)} tracked")
-        print(f"  Triggers: {len(event.triggers)} tracked\n")
+        print(f"  Triggers: {len(event.triggers)} tracked")
+        print(f"  Doors: {len(event.doors)} tracked\n")
 
     def on_zone_changed(event: ChangeEvent) -> None:
         if debug:
@@ -552,6 +703,22 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
             if changed_flags:
                 print(f"   Changed flags: {', '.join(changed_flags)}")
 
+    def on_door_changed(event: ChangeEvent) -> None:
+        if debug:
+            print(f"\U0001F6AA Door {event.id} ({event.name}) changed:")
+            print(f"   State: {event.old_data} \u2192 {event.new_data}")
+        else:
+            old_state = event.old_data.get("state") if event.old_data else None
+            new_state = event.new_data.get("state")
+            old_desc = str(old_state) if old_state else "unknown"
+            new_desc = str(new_state) if new_state else "unknown"
+            print(f"\U0001F6AA Door {event.id} ({event.name}): {old_desc} \u2192 {new_desc}")
+
+            # Show changed flags
+            changed_flags = get_changed_flags(old_state, new_state)
+            if changed_flags:
+                print(f"   Changed flags: {', '.join(changed_flags)}")
+
     def on_error(err: Exception) -> None:
         print(f"\n\u274C Monitor error: {err}")
 
@@ -561,6 +728,7 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
     monitor.on_area_changed(on_area_changed)
     monitor.on_output_changed(on_output_changed)
     monitor.on_trigger_changed(on_trigger_changed)
+    monitor.on_door_changed(on_door_changed)
     monitor.on_error(on_error)
 
     # Start monitoring
@@ -668,6 +836,8 @@ async def run_command(args: argparse.Namespace) -> int:
             await cmd_outputs(client, debug)
         elif args.command == "triggers":
             await cmd_triggers(client, debug)
+        elif args.command == "doors":
+            await cmd_doors(client, debug)
         elif args.command == "monitor":
             await cmd_monitor(client, debug)
         elif args.command == "arm":
@@ -686,6 +856,16 @@ async def run_command(args: argparse.Namespace) -> int:
             await cmd_trigger_activate(client, args.trigger)
         elif args.command == "trigger-deactivate":
             await cmd_trigger_deactivate(client, args.trigger)
+        elif args.command == "door-lock":
+            await cmd_door_lock(client, args.door)
+        elif args.command == "door-unlock":
+            await cmd_door_unlock(client, args.door)
+        elif args.command == "door-unlock-time":
+            await cmd_door_unlock_time(client, args.door, args.seconds)
+        elif args.command == "door-disable":
+            await cmd_door_disable(client, args.door)
+        elif args.command == "door-enable":
+            await cmd_door_enable(client, args.door)
         elif args.command == "event-log":
             await cmd_event_log(client, args.count)
         else:
