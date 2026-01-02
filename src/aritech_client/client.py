@@ -96,23 +96,33 @@ class StateResult:
 MODEL_AREAS = {
     "ATS1000": 4,
     "ATS1500": 4,
+    "ATS1700": 4,
     "ATS2000": 8,
     "ATS3500": 8,
+    "ATS3700": 8,
     "ATS4500": 64,
+    "ATS4700": 64,
 }
 
 MODEL_ZONES = {
     "ATS1000": 368,
     "ATS1500": 240,
+    "ATS1700": 240,
     "ATS2000": 368,
     "ATS3500": 496,
+    "ATS3700": 496,
     "ATS4500": 976,
+    "ATS4700": 976,
 }
 
-# Response parsing constants
+# Response parsing constants for standard format (x500 panels with protocol < 4.4)
 NAMES_START_OFFSET = 6  # Offset where names begin in getName responses
 NAME_LENGTH = 16  # Each name is 16 bytes, null-padded
 NAMES_PER_PAGE = 16  # Panel returns 16 names per request
+
+# Response parsing constants for extended format (x700 panels and x500 panels with protocol 4.4+)
+EXTENDED_NAME_LENGTH = 30  # Extended format uses 30-byte names
+EXTENDED_NAMES_PER_PAGE = 4  # Extended format returns 4 names per request
 
 # Event log direction constants
 EVENT_LOG_FIRST = 0x00
@@ -249,6 +259,14 @@ class AritechClient:
     def max_zone_count(self) -> int:
         """Maximum number of zones for this panel model."""
         return MODEL_ZONES.get(self._panel_model or "", 240)
+
+    @property
+    def is_x700_panel(self) -> bool:
+        """Check if this is an x700 series panel.
+
+        x700 panels (ATS1700, ATS3700, ATS4700) use different message formats.
+        """
+        return bool(self._panel_model and re.match(r"ATS\d700", self._panel_model))
 
     async def __aenter__(self) -> AritechClient:
         """Async context manager entry."""
@@ -454,6 +472,8 @@ class AritechClient:
         # Default password to username if not set
         password = self.config.password or self.config.username
 
+        # connectionMethod: 3 = MobileApps (matches mobile app capture)
+        # All permissions set to true except canDownload (matches mobile app for zone control)
         login_payload = construct_message(
             "loginWithAccount",
             {
@@ -461,11 +481,11 @@ class AritechClient:
                 "canDownload": False,
                 "canControl": True,
                 "canMonitor": True,
-                "canDiagnose": False,
-                "canReadLogs": False,
+                "canDiagnose": True,
+                "canReadLogs": True,
                 "username": self.config.username,
                 "password": password,
-                "connectionMethod": 1,  # TCP/IP
+                "connectionMethod": 3,  # MobileApps
             },
         )
 
@@ -480,6 +500,10 @@ class AritechClient:
             and response[2] == 0x00
         ):
             logger.debug("Login successful")
+
+            # x700 panels require getUserInfo call after login to activate session permissions
+            await self._get_user_info()
+
             self._start_keepalive()
             return
 
@@ -490,6 +514,22 @@ class AritechClient:
             code=ErrorCode.LOGIN_FAILED,
             status=status_code,
         )
+
+    async def _get_user_info(self) -> None:
+        """Get user info from panel - required on x700 after login to activate permissions."""
+        logger.debug("Getting user info...")
+        payload = construct_message("getUserInfo", {})
+        response = await self._call_encrypted(payload, self._session_key)
+
+        if response and response[0] == HEADER_RESPONSE:
+            # Response contains user name at offset 6, 16 bytes
+            if len(response) >= 22:
+                user_name = (
+                    response[6:22].decode("ascii", errors="ignore").rstrip("\x00").strip()
+                )
+                if user_name:
+                    logger.debug(f"Logged in as: {user_name}")
+            logger.debug("User session activated")
 
     def _start_keepalive(self) -> None:
         """Start keep-alive task."""
@@ -948,6 +988,8 @@ class AritechClient:
         """
         Generic helper for fetching entity names from the panel.
 
+        Handles pagination in batches (16 for x500, 4 for x700).
+
         Args:
             msg_name: Message name for the request (e.g., 'getAreaNames')
             response_name: Response message name (e.g., 'areaNames')
@@ -962,24 +1004,48 @@ class AritechClient:
 
         results: list[NamedItem] = []
 
+        # Use extended format parameters if applicable
+        # x700 panels and x500 panels with protocol 4.4+ use "Ext" format for areas and zones
+        # (30-byte names, 4 per page). Outputs and triggers use the standard format.
+        supports_extended = self.is_x700_panel or (
+            self._protocol_version and self._protocol_version >= 4004
+        )
+        has_extended_format = supports_extended and msg_name in (
+            "getAreaNames",
+            "getZoneNames",
+        )
+
+        if has_extended_format:
+            name_length = EXTENDED_NAME_LENGTH
+            names_per_page = EXTENDED_NAMES_PER_PAGE
+            actual_msg_name = msg_name + "Extended"
+            logger.debug(
+                f"Using extended format: {actual_msg_name}, "
+                f"{name_length}-byte names, {names_per_page} per page"
+            )
+        else:
+            name_length = NAME_LENGTH
+            names_per_page = NAMES_PER_PAGE
+            actual_msg_name = msg_name
+
         # Determine which pages to request
         pages_to_request: list[int] = []
         if valid_numbers:
             # Only request pages containing valid numbers
             page_set: set[int] = set()
             for num in valid_numbers:
-                page_start = ((num - 1) // NAMES_PER_PAGE) * NAMES_PER_PAGE + 1
+                page_start = ((num - 1) // names_per_page) * names_per_page + 1
                 page_set.add(page_start)
             pages_to_request = sorted(page_set)
         elif max_count:
             # Request pages up to max_count
-            pages_to_request = list(range(1, max_count + 1, NAMES_PER_PAGE))
+            pages_to_request = list(range(1, max_count + 1, names_per_page))
         else:
             # Request pages until empty (output/trigger style)
-            pages_to_request = list(range(1, 257, NAMES_PER_PAGE))
+            pages_to_request = list(range(1, 257, names_per_page))
 
         for start_index in pages_to_request:
-            payload = construct_message(msg_name, {"index": start_index})
+            payload = construct_message(actual_msg_name, {"index": start_index})
             response = await self._call_encrypted(payload, self._session_key)
 
             if not response:
@@ -993,16 +1059,16 @@ class AritechClient:
             ):
                 found_any = False
 
-                for i in range(NAMES_PER_PAGE):
-                    offset = NAMES_START_OFFSET + i * NAME_LENGTH
-                    if offset + NAME_LENGTH > len(response):
+                for i in range(names_per_page):
+                    offset = NAMES_START_OFFSET + i * name_length
+                    if offset + name_length > len(response):
                         break
 
                     entity_num = start_index + i
                     if max_count and entity_num > max_count:
                         break
 
-                    name_bytes = response[offset : offset + NAME_LENGTH]
+                    name_bytes = response[offset : offset + name_length]
                     name = (
                         name_bytes.decode("ascii", errors="ignore")
                         .rstrip("\x00")
@@ -1130,11 +1196,24 @@ class AritechClient:
         return results
 
     async def get_valid_areas(self) -> list[int]:
-        """Get list of valid/configured area numbers. Uses cached value if available."""
+        """Get list of valid/configured area numbers. Uses cached value if available.
+
+        x700 panels don't support getValidAreas - use all areas 1-N based on panel model.
+        """
         # Return cached value if available
         if self._valid_area_numbers is not None:
             logger.debug(f"Using cached valid areas: {self._valid_area_numbers}")
             return self._valid_area_numbers
+
+        logger.debug("Querying valid area numbers...")
+
+        # x700 panels don't support getValidAreas command - use all areas based on model
+        if self.is_x700_panel:
+            max_areas = self.max_area_count
+            valid_areas = list(range(1, max_areas + 1))
+            logger.debug(f"x700 panel: using all {max_areas} areas: {valid_areas}")
+            self._valid_area_numbers = valid_areas
+            return valid_areas
 
         payload = construct_message("getValidAreas", {})
         response = await self._call_encrypted(payload, self._session_key)
@@ -1972,9 +2051,24 @@ class AritechClient:
 
         logger.debug("Reading event log...")
 
+        # x700 panels and x500 panels with protocol 4.4+ use 60-byte events
+        # Older x500 panels use 70-byte events
+        is_x700 = self.is_x700_panel
+        is_extended_protocol = self._protocol_version and self._protocol_version >= 4004
+        event_size = 60 if (is_x700 or is_extended_protocol) else 70
+
+        if is_x700:
+            # x700 requires startMonitor first
+            start_payload = construct_message("startMonitor", {})
+            start_response = await self._call_encrypted(start_payload, self._session_key)
+            if start_response:
+                logger.debug(f"startMonitor response: {start_response.hex()}")
+
         # Open the log
         open_payload = construct_message("openLog", {})
-        await self._call_encrypted(open_payload, self._session_key)
+        init_response = await self._call_encrypted(open_payload, self._session_key)
+        if init_response:
+            logger.debug(f"openLog response: {init_response.hex()}")
 
         event_count = 0
         direction = EVENT_LOG_FIRST
@@ -2010,19 +2104,21 @@ class AritechClient:
                         break
                     continue
 
-                # Response payload is 70 bytes starting at offset 2 (after header + msgId)
+                # Response payload starts at offset 2 (after header + msgId)
                 event_data = response[2:]
 
-                if len(event_data) < 70:
-                    logger.debug(f"Event data too short: {len(event_data)} bytes")
+                if len(event_data) < event_size:
+                    logger.debug(
+                        f"Event data too short: {len(event_data)} bytes (expected {event_size})"
+                    )
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         break
                     continue
 
-                # Parse the 70-byte event
+                # Parse the event (60 bytes for x700, 70 bytes for x500)
                 try:
-                    event_buffer = event_data[:70]
+                    event_buffer = event_data[:event_size]
                     parsed_event = parse_event(event_buffer)
 
                     # Use parsed sequence for end detection
@@ -2041,7 +2137,7 @@ class AritechClient:
 
                 except Exception as parse_error:
                     logger.debug(f"Failed to parse event: {parse_error}")
-                    logger.debug(f"Raw event data: {event_data[:70].hex()}")
+                    logger.debug(f"Raw event data: {event_data[:event_size].hex()}")
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         break

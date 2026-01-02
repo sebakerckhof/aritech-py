@@ -1,9 +1,12 @@
 """
 Aritech ATS Event Log Parser.
 
-Parses 70-byte event messages into structured data.
+Parses event messages into structured data.
+Auto-detects format based on buffer length:
+- 60 bytes: New format (x700 panels and x500 panels with protocol 4.4+)
+- 70 bytes: Legacy format (x500 panels with protocol < 4.4)
 
-Event data structure (70 bytes total):
+Event data structure:
   Bytes 0-1:   Internal header (0x0020)
   Bytes 2-7:   Timestamp in BCD format (YYMMDDhhmmss)
   Bytes 8-11:  Reserved/unknown
@@ -15,7 +18,8 @@ Event data structure (70 bytes total):
   Bytes 18-19: Entity ID / sub-type (big-endian)
   Byte 20:     Area ID
   Bytes 21-27: Detail fields (context-dependent)
-  Bytes 28-69: Description text (42 bytes, NULL-padded ASCII)
+  Bytes 28-59: Description text (32 bytes for new format, NULL-padded ASCII)
+  Bytes 28-69: Description text (42 bytes for legacy format, NULL-padded ASCII)
 """
 
 from __future__ import annotations
@@ -210,19 +214,31 @@ def _parse_entity(class_device_id: int, sub_type: int) -> tuple[int, str, EventE
 
 def parse_event(event_buffer: bytes) -> ParsedEvent:
     """
-    Parse a 70-byte event buffer into structured data.
+    Parse an event buffer into structured data.
+
+    Auto-detects format based on buffer length:
+    - 60 bytes: New format (x700 panels and x500 panels with protocol 4.4+)
+    - 70 bytes: Legacy format (x500 panels with protocol < 4.4)
 
     Args:
-        event_buffer: 70-byte event data
+        event_buffer: 60 or 70-byte event data
 
     Returns:
         ParsedEvent object
 
     Raises:
-        ValueError: If buffer is not exactly 70 bytes
+        ValueError: If buffer is not 60 or 70 bytes
     """
-    if len(event_buffer) != 70:
-        raise ValueError(f"Event buffer must be exactly 70 bytes, got {len(event_buffer)}")
+    if len(event_buffer) == 60:
+        # New format: 32-byte description (x700, x500 4.4+)
+        description_length = 32
+    elif len(event_buffer) == 70:
+        # Legacy format: 42-byte description (x500 < 4.4)
+        description_length = 42
+    else:
+        raise ValueError(
+            f"Event buffer must be 60 (new) or 70 (legacy) bytes, got {len(event_buffer)}"
+        )
 
     # Parse timestamp from BCD bytes (offset 2)
     timestamp = _parse_bcd_timestamp(event_buffer, 2)
@@ -236,9 +252,12 @@ def parse_event(event_buffer: bytes) -> ParsedEvent:
     entity_id = (event_buffer[18] << 8) | event_buffer[19]  # big-endian
     area_id = event_buffer[20]
 
-    # Description text (bytes 28-69, 42 bytes)
+    # Description text (32 bytes for x700, 42 bytes for x500)
     description = (
-        event_buffer[28:70].decode("ascii", errors="ignore").rstrip("\x00").strip()
+        event_buffer[28 : 28 + description_length]
+        .decode("ascii", errors="ignore")
+        .rstrip("\x00")
+        .strip()
     )
 
     # Look up event type info
@@ -269,24 +288,25 @@ def parse_event(event_buffer: bytes) -> ParsedEvent:
     )
 
 
-def parse_events(buffer: bytes) -> list[ParsedEvent | dict[str, Any]]:
+def parse_events(buffer: bytes, event_size: int = 70) -> list[ParsedEvent | dict[str, Any]]:
     """
     Parse multiple events from a buffer.
 
     Args:
-        buffer: Buffer containing one or more 70-byte events
+        buffer: Buffer containing one or more events
+        event_size: Size of each event (60 for new format, 70 for legacy)
 
     Returns:
         List of ParsedEvent objects or error dicts
     """
     events: list[ParsedEvent | dict[str, Any]] = []
-    event_count = len(buffer) // 70
+    event_count = len(buffer) // event_size
 
     for i in range(event_count):
-        offset = i * 70
-        event_buffer = buffer[offset : offset + 70]
+        offset = i * event_size
+        event_buffer = buffer[offset : offset + event_size]
 
-        if len(event_buffer) == 70:
+        if len(event_buffer) == event_size:
             try:
                 events.append(parse_event(event_buffer))
             except Exception as e:

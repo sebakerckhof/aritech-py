@@ -1,15 +1,15 @@
-# ATS Advisor Client for Python (Unofficial)
+# Aritech Client for Python (Unofficial)
 
-An unofficial, community-developed async Python client to monitor and control ATS alarm panels over your local network.
+An unofficial, community-developed async Python client to monitor and control KGS (formerly UTC and Carrier) Aritech alarm panels over your local network.
 
-**This project is not affiliated with, endorsed by, or supported by UTC, Carrier, or any of their subsidiaries.**
+**This project is not affiliated with, endorsed by, or supported by KGS, UTC, Carrier, or any of their subsidiaries.**
 
 ## Compatibility
 
 This library supports the ACE 2 ATS version 6 protocol, which works with Advisor Advanced panels:
 
 - **x500 panels**: ATS1500A, ATS2000A, ATS3500A, ATS4500A (PIN-based login, AES-192)
-- **x700 panels**: ATS1500A-IP-MM, ATS3500A-IP-MM, ATS4500A-IP-MM (username/password login, AES-256)
+- **x700 (everon) panels**: ATS1500A-IP-MM, ATS3500A-IP-MM, ATS4500A-IP-MM (username/password login, AES-256)
 
 The older version 4 protocol for Master/Classic panels is not supported.
 
@@ -304,7 +304,7 @@ This is an independent project developed through protocol analysis. It is not ba
 
 ## Trademarks
 
-ATS, Advisor, and Aritech are trademarks of Carrier Fire & Security. All other trademarks are the property of their respective owners. The use of these trademarks does not imply any affiliation with or endorsement by their owners.
+ATS, Advisor, and Aritech are trademarks of KGS Fire & Security. All other trademarks are the property of their respective owners. The use of these trademarks does not imply any affiliation with or endorsement by their owners.
 
 ## License
 

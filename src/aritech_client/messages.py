@@ -231,34 +231,33 @@ _register(
 )
 
 # x700 panels: Username/password login (device.getLogPassConnect)
-# Byte layout: [0x06][0x0f][0x06][typeId][6 permission flags][32-byte username][0x20 len][32-byte password][conn info]
-# The 6th permission (canReadLogs) at templateBytes[9] defaults to 0x20 (enabled)
+# Based on mobile app capture - payloadLength 79 bytes (including msgId byte)
+# Byte layout: [0x06][0x0f][0x06][6 permission flags][0x20 usrlen][32-byte username][0x20 pwdlen][32-byte password][connMethod][connMethodExt][RFU]
+# Mobile app payload: 060f06 010001010101 20 cccc...32bytes... 20 cccc...32bytes... 030000
 _register(
     "loginWithAccount",
     msg_id=3,
     msg_id_bytes=[0x06],
     template_bytes=[
         0x06, 0x0F, 0x06,  # templateBytes 0-2: sub-type markers
-        0x00,              # templateBytes 3: typeId
-        0x00, 0x00, 0x00, 0x00, 0x00,  # templateBytes 4-8: 5 permission flags
-        0x20,              # templateBytes 9: canReadLogs (default 0x20 = enabled)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # templateBytes 3-8: 6 permission flags (upload, download, control, monitor, diagnose, readLogs)
+        0x20,              # templateBytes 9: username length marker (0x20 = 32, fixed)
         *([0x00] * 32),    # templateBytes 10-41: username (32 bytes, null-padded)
-        0x20,              # templateBytes 42: password length marker (0x20 = 32)
+        0x20,              # templateBytes 42: password length marker (0x20 = 32, fixed)
         *([0x00] * 32),    # templateBytes 43-74: password (32 bytes, null-padded)
         0x00, 0x00, 0x00,  # templateBytes 75-77: connMethod, connMethodExt, RFU
     ],
     payload_length=79,
     properties={
-        # Byte offsets match JS: buffer[byteOffset + 1] = templateBytes[byteOffset - 1]
-        "typeId": [{"byte": 4}],
-        "canUpload": [{"byte": 5}],
-        "canDownload": [{"byte": 6}],
-        "canControl": [{"byte": 7}],
-        "canMonitor": [{"byte": 8}],
-        "canDiagnose": [{"byte": 9}],
-        "canReadLogs": [{"byte": 10}],  # templateBytes[9] - defaults to 0x20
-        "username": [{"byte": 11, "length": 32}],
-        "password": [{"byte": 44, "length": 32}],
+        # Byte offsets are relative to after header (byte 0 = msgId), so bufferIndex = byteOffset + 1
+        "canUpload": [{"byte": 4}],
+        "canDownload": [{"byte": 5}],
+        "canControl": [{"byte": 6}],
+        "canMonitor": [{"byte": 7}],
+        "canDiagnose": [{"byte": 8}],
+        "canReadLogs": [{"byte": 9}],
+        "username": [{"byte": 11, "length": 32}],  # skip len marker at byte 10
+        "password": [{"byte": 44, "length": 32}],  # skip len marker at byte 43
         "connectionMethod": [{"byte": 76}],
         "connectionMethodExtended": [{"byte": 77}],
         "reservedForFutureUse": [{"byte": 78}],
@@ -460,6 +459,32 @@ for name, type_byte in [
         },
     )
 
+# Extended format for name queries (x700 panels and x500 panels with protocol 4.4+)
+# Uses 0x19 message ID (same as response), 30-byte names, 4 names per page
+_register(
+    "getAreaNamesExtended",
+    msg_id=-13,
+    msg_id_bytes=[0x19],
+    template_bytes=[0x02, 0x00, 0x03, 0x00, 0x00],
+    payload_length=6,
+    properties={
+        "typeId": [{"byte": 3}],
+        "index": [{"byte": 5}],
+    },
+)
+
+_register(
+    "getZoneNamesExtended",
+    msg_id=-13,
+    msg_id_bytes=[0x19],
+    template_bytes=[0x01, 0x00, 0x03, 0x00, 0x00],
+    payload_length=6,
+    properties={
+        "typeId": [{"byte": 3}],
+        "index": [{"byte": 5}],
+    },
+)
+
 # Name responses
 for name, type_byte in [
     ("areaNames", 0x02),
@@ -653,6 +678,16 @@ _register(
         "area": [{"byte": 20}],
         "eventText": [{"byte": 29, "length": 32, "type": "string"}],
     },
+)
+
+# x700 panels require start.MONITOR before reading event logs
+_register(
+    "startMonitor",
+    msg_id=-101,
+    msg_id_bytes=[0xC9, 0x01],
+    template_bytes=[0x00, 0x00],
+    payload_length=4,
+    properties={},
 )
 
 
