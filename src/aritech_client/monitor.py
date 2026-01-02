@@ -30,16 +30,6 @@ COS_CHANGE_TYPES = {
 }
 
 
-def build_cos_acknowledgment() -> bytes:
-    """
-    Build COS acknowledgment message.
-
-    Format: a0 00 01 01 (response header 0xA0, msgId 0, ack bytes)
-    This ack tells the panel we received the COS notification.
-    """
-    return bytes([0xA0, 0x00, 0x01, 0x01])
-
-
 @dataclass
 class ChangeEvent:
     """Event data for a state change."""
@@ -171,9 +161,11 @@ class AritechMonitor:
             await self._initialize()
             self._setup_cos_handler()
             self._running = True
-            self.client.monitoring_active = True
 
-            # Start background reader to receive COS events
+            # Start background reader and enable monitoring
+            # Note: start_background_reader sets _reader_should_run before creating the task,
+            # so the reader loop will run properly regardless of monitoring_active timing
+            self.client.monitoring_active = True
             self.client.start_background_reader()
 
             logger.debug("Monitor started successfully")
@@ -321,9 +313,7 @@ class AritechMonitor:
                     change_type = "trigger"
                 logger.debug(f"Change type: {change_type}")
 
-            # Send acknowledgment
-            ack_payload = build_cos_acknowledgment()
-            await self.client.send_encrypted(ack_payload, self.client.session_key)
+            # Note: COS ACK is sent by the client layer in _handle_unsolicited_frame/_handle_cos_inline
 
             # Small delay before querying
             await asyncio.sleep(0.05)

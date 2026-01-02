@@ -218,15 +218,16 @@ _register(
     template_bytes=[0x06, 0x0B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     payload_length=25,
     properties={
-        "typeId": [{"byte": 3}],
-        "canUpload": [{"byte": 4}],
-        "canDownload": [{"byte": 5}],
-        "canControl": [{"byte": 6}],
-        "canMonitor": [{"byte": 7}],
-        "canDiagnose": [{"byte": 8}],
-        "canReadLogs": [{"byte": 9}],
+        # Use type: 'byte' for single-byte values to prevent 2-byte writes
+        "typeId": [{"byte": 3, "type": "byte"}],
+        "canUpload": [{"byte": 4, "type": "byte"}],
+        "canDownload": [{"byte": 5, "type": "byte"}],
+        "canControl": [{"byte": 6, "type": "byte"}],
+        "canMonitor": [{"byte": 7, "type": "byte"}],
+        "canDiagnose": [{"byte": 8, "type": "byte"}],
+        "canReadLogs": [{"byte": 9, "type": "byte"}],
         "pinCode": [{"byte": 11, "length": 10}],
-        "connectionMethod": [{"byte": 22}],
+        "connectionMethod": [{"byte": 22, "type": "byte"}],
     },
 )
 
@@ -250,17 +251,18 @@ _register(
     payload_length=79,
     properties={
         # Byte offsets are relative to after header (byte 0 = msgId), so bufferIndex = byteOffset + 1
-        "canUpload": [{"byte": 4}],
-        "canDownload": [{"byte": 5}],
-        "canControl": [{"byte": 6}],
-        "canMonitor": [{"byte": 7}],
-        "canDiagnose": [{"byte": 8}],
-        "canReadLogs": [{"byte": 9}],
+        # Use type: 'byte' for single-byte values to prevent 2-byte writes
+        "canUpload": [{"byte": 4, "type": "byte"}],
+        "canDownload": [{"byte": 5, "type": "byte"}],
+        "canControl": [{"byte": 6, "type": "byte"}],
+        "canMonitor": [{"byte": 7, "type": "byte"}],
+        "canDiagnose": [{"byte": 8, "type": "byte"}],
+        "canReadLogs": [{"byte": 9, "type": "byte"}],
         "username": [{"byte": 11, "length": 32}],  # skip len marker at byte 10
         "password": [{"byte": 44, "length": 32}],  # skip len marker at byte 43
-        "connectionMethod": [{"byte": 76}],
-        "connectionMethodExtended": [{"byte": 77}],
-        "reservedForFutureUse": [{"byte": 78}],
+        "connectionMethod": [{"byte": 76, "type": "byte"}],
+        "connectionMethodExtended": [{"byte": 77, "type": "byte"}],
+        "reservedForFutureUse": [{"byte": 78, "type": "byte"}],
     },
 )
 

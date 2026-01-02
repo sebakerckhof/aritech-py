@@ -180,6 +180,8 @@ class AritechClient:
                     "encryption_key", config.get("encryptionKey", "")
                 ),
                 serial=config.get("serial"),
+                username=config.get("username", ""),
+                password=config.get("password", ""),
             )
         else:
             self.config = config
@@ -219,6 +221,7 @@ class AritechClient:
 
         # Background reader task - single reader that fans out messages
         self._reader_task: asyncio.Task[None] | None = None
+        self._reader_should_run: bool = False  # Controls reader loop, separate from monitoring_active
         # Pending response future - commands wait on this for their response
         self._pending_response: asyncio.Future[bytes] | None = None
         # Command queue lock - ensures control operations are serialized
@@ -539,33 +542,37 @@ class AritechClient:
         self._keepalive_failures = 0
 
         async def keepalive() -> None:
-            while True:
-                try:
-                    await asyncio.sleep(30)
-                    if self._session_key and self._writer:
-                        msg = construct_message("ping", {})
-                        await self._call_encrypted(msg, self._session_key)
-                        # Successful ping, reset failure counter
-                        self._keepalive_failures = 0
-                    else:
-                        # No session/writer, stop keepalive
-                        logger.debug("Keep-alive stopping: no session/writer")
-                        await self._emit_connection_lost()
-                        break
-                except asyncio.CancelledError:
-                    # Task was cancelled, exit cleanly
-                    break
-                except Exception as e:
-                    self._keepalive_failures += 1
-                    logger.warning(
-                        f"Keep-alive failed ({self._keepalive_failures}/{self._max_keepalive_failures}): {e}"
-                    )
-                    if self._keepalive_failures >= self._max_keepalive_failures:
-                        logger.error(
-                            f"Connection lost: {self._keepalive_failures} consecutive keep-alive failures"
+            try:
+                while True:
+                    try:
+                        await asyncio.sleep(30)
+                        if self._session_key and self._writer:
+                            msg = construct_message("ping", {})
+                            await self._call_encrypted(msg, self._session_key)
+                            # Successful ping, reset failure counter
+                            self._keepalive_failures = 0
+                        else:
+                            # No session/writer, stop keepalive
+                            logger.debug("Keep-alive stopping: no session/writer")
+                            await self._emit_connection_lost()
+                            break
+                    except asyncio.CancelledError:
+                        # Task was cancelled, exit cleanly
+                        raise
+                    except Exception as e:
+                        self._keepalive_failures += 1
+                        logger.warning(
+                            f"Keep-alive failed ({self._keepalive_failures}/{self._max_keepalive_failures}): {e}"
                         )
-                        await self._emit_connection_lost()
-                        break
+                        if self._keepalive_failures >= self._max_keepalive_failures:
+                            logger.error(
+                                f"Connection lost: {self._keepalive_failures} consecutive keep-alive failures"
+                            )
+                            await self._emit_connection_lost()
+                            break
+            finally:
+                # Clear task reference so _start_keepalive can restart on reconnect
+                self._keepalive_task = None
 
         self._keepalive_task = asyncio.create_task(keepalive())
 
@@ -580,6 +587,8 @@ class AritechClient:
         if self._reader_task:
             return
 
+        self._reader_should_run = True
+
         async def reader_loop() -> None:
             """
             Single reader that handles ALL incoming frames.
@@ -590,46 +599,62 @@ class AritechClient:
             logger.debug("Background reader started")
             frame_count = 0
 
-            while self._monitoring_active and self._reader and self._session_key:
-                try:
-                    # Read next frame (with timeout so we can check _monitoring_active)
-                    frame = await self._read_frame_direct(timeout=1.0)
-                    if not frame:
-                        continue
+            try:
+                while self._reader_should_run and self._reader and self._session_key:
+                    try:
+                        # Read next frame (with timeout so we can check loop condition)
+                        frame = await self._read_frame_direct(timeout=1.0)
 
-                    frame_count += 1
-                    logger.debug(f"Background reader got frame #{frame_count}: {len(frame)} bytes")
+                        frame_count += 1
+                        logger.debug(f"Background reader got frame #{frame_count}: {len(frame)} bytes")
 
-                    # Check if it's an unsolicited message (COS or other panel notification)
-                    if self._is_unsolicited_message(frame):
-                        logger.debug("  -> Unsolicited message, processing...")
-                        await self._handle_unsolicited_frame(frame)
-                    else:
-                        # It's a command response - deliver to waiting command
-                        logger.debug("  -> Command response")
-                        if self._pending_response and not self._pending_response.done():
-                            self._pending_response.set_result(frame)
+                        # Check if it's an unsolicited message (COS or other panel notification)
+                        if self._is_unsolicited_message(frame):
+                            logger.debug("  -> Unsolicited message, processing...")
+                            await self._handle_unsolicited_frame(frame)
                         else:
-                            # No one waiting - this shouldn't happen normally
-                            logger.debug("  -> No pending command, discarding")
+                            # It's a command response - deliver to waiting command
+                            logger.debug("  -> Command response")
+                            if self._pending_response and not self._pending_response.done():
+                                self._pending_response.set_result(frame)
+                            else:
+                                # No one waiting - this shouldn't happen normally
+                                logger.debug("  -> No pending command, discarding")
 
-                except asyncio.TimeoutError:
-                    # No data available, continue polling
-                    continue
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.debug(f"Background reader error: {e}")
-                    await asyncio.sleep(0.1)
-
-            logger.debug(f"Background reader stopped (read {frame_count} frames)")
+                    except asyncio.TimeoutError:
+                        # No data available, continue polling
+                        continue
+                    except asyncio.CancelledError:
+                        # Task was cancelled, propagate through finally
+                        raise
+                    except AritechError as e:
+                        # Connection lost or other protocol error - fail pending commands and exit
+                        logger.error(f"Background reader error: {e}")
+                        if self._pending_response and not self._pending_response.done():
+                            self._pending_response.set_exception(e)
+                        await self._emit_connection_lost()
+                        break
+                    except Exception as e:
+                        logger.debug(f"Background reader unexpected error: {e}")
+                        await asyncio.sleep(0.1)
+            finally:
+                # Clear state so commands don't route to dead reader and restarts are possible
+                logger.debug(f"Background reader stopped (read {frame_count} frames)")
+                self._reader_task = None
+                self._reader_should_run = False
+                self._monitoring_active = False
 
         self._reader_task = asyncio.create_task(reader_loop())
 
-    async def _read_frame_direct(self, timeout: float = 5.0) -> bytes | None:
-        """Read a single SLIP frame directly from socket (no fan-out logic)."""
+    async def _read_frame_direct(self, timeout: float = 5.0) -> bytes:
+        """Read a single SLIP frame directly from socket (no fan-out logic).
+
+        Raises:
+            AritechError: If connection is closed (EOF) or not connected
+            asyncio.TimeoutError: If timeout expires before a complete frame
+        """
         if not self._reader:
-            return None
+            raise AritechError("Not connected", code=ErrorCode.CONNECTION_FAILED)
 
         end_time = asyncio.get_event_loop().time() + timeout
 
@@ -655,7 +680,10 @@ class AritechClient:
                     self._reader.read(1024), timeout=min(remaining, 0.5)
                 )
                 if not data:
-                    return None
+                    # EOF - connection closed by remote
+                    raise AritechError(
+                        "Connection closed by panel", code=ErrorCode.CONNECTION_FAILED
+                    )
                 self._receive_buffer.extend(data)
             except asyncio.TimeoutError:
                 if asyncio.get_event_loop().time() >= end_time:
@@ -684,11 +712,23 @@ class AritechClient:
         except Exception:
             return False
 
+    async def _send_cos_ack(self) -> None:
+        """Send COS acknowledgment to the panel.
+
+        Format: a0 00 01 01 (response header 0xA0, msgId 0, ack bytes)
+        Bypasses command lock to avoid being delayed by in-flight commands.
+        """
+        ack_payload = bytes([0xA0, 0x00, 0x01, 0x01])
+        try:
+            await self.send_encrypted(ack_payload, self._session_key, bypass_lock=True)
+        except Exception as e:
+            logger.debug(f"Failed to send COS ACK: {e}")
+
     async def _handle_unsolicited_frame(self, frame: bytes) -> None:
         """
         Process an unsolicited message from the panel.
 
-        If it's a COS message (0xCA prefix), spawns listener tasks.
+        If it's a COS message (0xCA prefix), sends ACK and spawns listener tasks.
         Otherwise, logs a warning about unhandled unsolicited message.
         """
         try:
@@ -707,6 +747,9 @@ class AritechClient:
                     f"COS event received: type=0x{cos_type:02x}, "
                     f"status=0x{status_val:02x}"
                 )
+
+                # Send ACK immediately to prevent panel retransmits
+                await self._send_cos_ack()
 
                 # Spawn listener tasks - don't await them!
                 # This prevents deadlock: listeners may send commands that need
@@ -738,8 +781,36 @@ class AritechClient:
         except Exception as e:
             logger.error(f"Error in COS listener: {e}")
 
+    async def _handle_cos_inline(self, decrypted: bytes) -> None:
+        """
+        Handle a COS message that arrived during a request/response cycle.
+
+        Sends ACK and spawns listener tasks to prevent deadlock.
+        """
+        if len(decrypted) < 3:
+            return
+
+        cos_type = decrypted[2]
+        payload = decrypted[3:]  # Skip C0 CA XX
+        status_byte = payload[2] if len(payload) >= 3 else None
+
+        status_val = status_byte if status_byte is not None else 0
+        logger.debug(
+            f"COS inline: type=0x{cos_type:02x}, status=0x{status_val:02x}"
+        )
+
+        # Send ACK immediately to prevent panel retransmits
+        await self._send_cos_ack()
+
+        # Spawn listener tasks (don't await to prevent deadlock)
+        for listener in self._event_listeners:
+            asyncio.create_task(
+                self._run_cos_listener(listener, status_byte, payload)
+            )
+
     def stop_background_reader(self) -> None:
         """Stop background reader task."""
+        self._reader_should_run = False
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
@@ -876,8 +947,18 @@ class AritechClient:
                 if asyncio.get_event_loop().time() >= end_time:
                     raise AritechError("Receive timeout", code=ErrorCode.TIMEOUT)
 
-    async def send_encrypted(self, payload: bytes, key: bytes | None = None) -> None:
-        """Send an encrypted message without waiting for response."""
+    async def send_encrypted(
+        self, payload: bytes, key: bytes | None = None, *, bypass_lock: bool = False
+    ) -> None:
+        """Send an encrypted message without waiting for response.
+
+        Args:
+            payload: The message payload to send
+            key: Encryption key (defaults to session key)
+            bypass_lock: If True, skip the command lock. Use for time-critical
+                messages like COS acknowledgments that shouldn't be delayed
+                by in-flight commands.
+        """
         if key is None:
             key = self._session_key
         if not key or not self._serial_bytes:
@@ -886,9 +967,13 @@ class AritechClient:
         encrypted = encrypt_message(payload, key, self._serial_bytes)
         frame = slip_encode(encrypted)
 
-        async with self._with_command_lock():
-            logger.debug(f"TX (enc, no-wait): {frame.hex()}")
+        if bypass_lock:
+            logger.debug(f"TX (enc, no-wait, no-lock): {frame.hex()}")
             await self._send_raw(frame)
+        else:
+            async with self._with_command_lock():
+                logger.debug(f"TX (enc, no-wait): {frame.hex()}")
+                await self._send_raw(frame)
 
     async def _call_plain(self, payload: bytes) -> bytes:
         """Send unencrypted message and receive response."""
@@ -921,20 +1006,59 @@ class AritechClient:
         frame = slip_encode(encrypted)
 
         async with self._with_command_lock():
-            # If monitoring active, bg reader will deliver response via Future
-            if self._monitoring_active and self._reader_task:
-                self._pending_response = asyncio.get_running_loop().create_future()
+            use_background_reader = self._monitoring_active and self._reader_task
             try:
+                # Create Future BEFORE sending so fast responses aren't lost
+                if use_background_reader:
+                    self._pending_response = asyncio.get_running_loop().create_future()
+
                 logger.debug(f"TX (enc): {frame.hex()}")
                 await self._send_raw(frame)
 
-                # Otherwise we read directly
-                response = await self._receive_frame()
+                if use_background_reader:
+                    # Background reader filters COS messages via _handle_unsolicited_frame,
+                    # so we only receive command responses here - no loop needed
+                    response = await self._receive_frame()
+                    logger.debug(f"RX (enc): {response.hex()}")
+                else:
+                    # Direct reading - unsolicited messages (header 0xC0) can arrive
+                    # interleaved with responses, so we must handle them and keep waiting
+                    max_unsolicited_reads = 5
+                    for _ in range(max_unsolicited_reads):
+                        response = await self._receive_frame()
+                        logger.debug(f"RX (enc): {response.hex()}")
+
+                        decrypted = decrypt_message(response, key, self._serial_bytes)
+                        # Check for unsolicited message (header 0xC0 = request from panel)
+                        if (
+                            decrypted
+                            and len(decrypted) >= 2
+                            and decrypted[0] == HEADER_REQUEST
+                        ):
+                            # Handle unsolicited message and continue waiting for response
+                            if decrypted[1] == 0xCA:
+                                logger.debug("Received COS during request, handling and waiting for response")
+                                await self._handle_cos_inline(decrypted)
+                            else:
+                                # Non-COS unsolicited message - log and skip
+                                logger.warning(
+                                    f"Received unsolicited message during request: "
+                                    f"msgId=0x{decrypted[1]:02x}, skipping"
+                                )
+                            continue
+                        # Got a response (header 0xA0 or 0xF0), break out
+                        break
+                    else:
+                        # Loop exhausted without getting a real response - raise error
+                        raise AritechError(
+                            "Too many unsolicited messages received while waiting for response",
+                            code=ErrorCode.PROTOCOL_ERROR,
+                        )
+
             except Exception:
                 if self._pending_response and not self._pending_response.done():
                     self._pending_response = None
                 raise
-        logger.debug(f"RX (enc): {response.hex()}")
 
         decrypted = decrypt_message(response, key, self._serial_bytes)
         if not decrypted:
