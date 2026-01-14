@@ -22,7 +22,7 @@ from typing import Any
 from .client import AritechClient, AritechConfig
 from .errors import AritechError
 from .monitor import AritechMonitor, ChangeEvent, InitializedEvent
-from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, FilterState, OutputState, TriggerState, ZoneState
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -99,7 +99,7 @@ Examples:
     aritech-cli disarm 1
     aritech-cli inhibit 12
     aritech-cli outputs
-    aritech-cli activate 1
+    aritech-cli force-activate 1
     aritech-cli event-log 50
 """,
     )
@@ -140,6 +140,9 @@ Examples:
     # doors
     subparsers.add_parser("doors", help="Show door names and states")
 
+    # filters
+    subparsers.add_parser("filters", help="Show filter names and states")
+
     # arm
     arm_parser = subparsers.add_parser("arm", help="Arm an area")
     arm_parser.add_argument("area", type=int, nargs="?", default=1, help="Area number (default: 1)")
@@ -164,13 +167,23 @@ Examples:
     uninhibit_parser = subparsers.add_parser("uninhibit", help="Uninhibit a zone")
     uninhibit_parser.add_argument("zone", type=int, help="Zone number")
 
-    # activate (output)
-    activate_parser = subparsers.add_parser("activate", help="Activate an output")
-    activate_parser.add_argument("output", type=int, help="Output number")
+    # force-activate (output)
+    force_act_parser = subparsers.add_parser(
+        "force-activate", help="Force activate an output (override to ON)"
+    )
+    force_act_parser.add_argument("output", type=int, help="Output number")
 
-    # deactivate (output)
-    deactivate_parser = subparsers.add_parser("deactivate", help="Deactivate an output")
-    deactivate_parser.add_argument("output", type=int, help="Output number")
+    # force-deactivate (output)
+    force_deact_parser = subparsers.add_parser(
+        "force-deactivate", help="Force deactivate an output (override to OFF)"
+    )
+    force_deact_parser.add_argument("output", type=int, help="Output number")
+
+    # cancel-force (output)
+    cancel_force_parser = subparsers.add_parser(
+        "cancel-force", help="Cancel force on output (return to normal)"
+    )
+    cancel_force_parser.add_argument("output", type=int, help="Output number")
 
     # trigger-activate
     trig_act_parser = subparsers.add_parser("trigger-activate", help="Activate a trigger")
@@ -473,6 +486,32 @@ async def cmd_doors(client: AritechClient, debug: bool = False) -> None:
             print(f"     Raw: {state.raw_flags}")
 
 
+async def cmd_filters(client: AritechClient, debug: bool = False) -> None:
+    """Show filter names and states."""
+    print("\nQuerying filter names...")
+    filters = await client.get_filter_names()
+    print(f"Found {len(filters)} filters\n")
+
+    if not filters:
+        print("No filters found on this panel.")
+        return
+
+    print("Querying filter states...")
+    states = await client.get_filter_states([f.number for f in filters])
+    states_by_id = {s.number: s.state for s in states}
+
+    print("\nFilters:")
+    for filter_item in filters:
+        state = states_by_id.get(filter_item.number)
+        icon = "\U0001F7E2" if state and state.is_active else "\u26ab"  # green or black circle
+        state_str = str(state) if state else "unknown"
+        print(f"  {icon} Filter {filter_item.number}: {filter_item.name}")
+        print(f"     State: {state_str}")
+
+        if debug and state:
+            print(f"     Raw: {state.raw_flags}")
+
+
 async def cmd_arm(client: AritechClient, area: int, set_type: str, force: bool) -> None:
     """Arm an area."""
     print(f"\nArming area {area} ({set_type}{', force' if force else ''})...")
@@ -523,24 +562,34 @@ async def cmd_uninhibit(client: AritechClient, zone: int) -> None:
         print(f"\u2717 Failed to uninhibit zone {zone}: {e}")
 
 
-async def cmd_activate(client: AritechClient, output: int) -> None:
-    """Activate an output."""
-    print(f"\nActivating output {output}...")
+async def cmd_force_activate(client: AritechClient, output: int) -> None:
+    """Force activate an output (override to ON)."""
+    print(f"\nForce activating output {output}...")
     try:
-        await client.activate_output(output)
-        print(f"\u2713 Output {output} activated successfully!")
+        await client.force_activate_output(output)
+        print(f"\u2713 Output {output} force activated (overridden to ON)!")
     except AritechError as e:
-        print(f"\u2717 Failed to activate output {output}: {e}")
+        print(f"\u2717 Failed to force activate output {output}: {e}")
 
 
-async def cmd_deactivate(client: AritechClient, output: int) -> None:
-    """Deactivate an output."""
-    print(f"\nDeactivating output {output}...")
+async def cmd_force_deactivate(client: AritechClient, output: int) -> None:
+    """Force deactivate an output (override to OFF)."""
+    print(f"\nForce deactivating output {output}...")
     try:
-        await client.deactivate_output(output)
-        print(f"\u2713 Output {output} deactivated successfully!")
+        await client.force_deactivate_output(output)
+        print(f"\u2713 Output {output} force deactivated (overridden to OFF)!")
     except AritechError as e:
-        print(f"\u2717 Failed to deactivate output {output}: {e}")
+        print(f"\u2717 Failed to force deactivate output {output}: {e}")
+
+
+async def cmd_cancel_force(client: AritechClient, output: int) -> None:
+    """Cancel force on an output (return to normal)."""
+    print(f"\nCanceling force on output {output}...")
+    try:
+        await client.cancel_force_output(output)
+        print(f"\u2713 Output {output} force canceled (returned to normal)!")
+    except AritechError as e:
+        print(f"\u2717 Failed to cancel force on output {output}: {e}")
 
 
 async def cmd_trigger_activate(client: AritechClient, trigger: int) -> None:
@@ -637,7 +686,8 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
         print(f"  Areas: {len(event.areas)} tracked")
         print(f"  Outputs: {len(event.outputs)} tracked")
         print(f"  Triggers: {len(event.triggers)} tracked")
-        print(f"  Doors: {len(event.doors)} tracked\n")
+        print(f"  Doors: {len(event.doors)} tracked")
+        print(f"  Filters: {len(event.filters)} tracked\n")
 
     def on_zone_changed(event: ChangeEvent) -> None:
         if debug:
@@ -719,6 +769,17 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
             if changed_flags:
                 print(f"   Changed flags: {', '.join(changed_flags)}")
 
+    def on_filter_changed(event: ChangeEvent) -> None:
+        if debug:
+            print(f"\U0001F532 Filter {event.id} ({event.name}) changed:")
+            print(f"   State: {event.old_data} \u2192 {event.new_data}")
+        else:
+            old_state = event.old_data.get("state") if event.old_data else None
+            new_state = event.new_data.get("state")
+            old_desc = str(old_state) if old_state else "unknown"
+            new_desc = str(new_state) if new_state else "unknown"
+            print(f"\U0001F532 Filter {event.id} ({event.name}): {old_desc} \u2192 {new_desc}")
+
     def on_error(err: Exception) -> None:
         print(f"\n\u274C Monitor error: {err}")
 
@@ -729,6 +790,7 @@ async def cmd_monitor(client: AritechClient, debug: bool = False) -> None:
     monitor.on_output_changed(on_output_changed)
     monitor.on_trigger_changed(on_trigger_changed)
     monitor.on_door_changed(on_door_changed)
+    monitor.on_filter_changed(on_filter_changed)
     monitor.on_error(on_error)
 
     # Start monitoring
@@ -838,6 +900,8 @@ async def run_command(args: argparse.Namespace) -> int:
             await cmd_triggers(client, debug)
         elif args.command == "doors":
             await cmd_doors(client, debug)
+        elif args.command == "filters":
+            await cmd_filters(client, debug)
         elif args.command == "monitor":
             await cmd_monitor(client, debug)
         elif args.command == "arm":
@@ -848,10 +912,12 @@ async def run_command(args: argparse.Namespace) -> int:
             await cmd_inhibit(client, args.zone)
         elif args.command == "uninhibit":
             await cmd_uninhibit(client, args.zone)
-        elif args.command == "activate":
-            await cmd_activate(client, args.output)
-        elif args.command == "deactivate":
-            await cmd_deactivate(client, args.output)
+        elif args.command == "force-activate":
+            await cmd_force_activate(client, args.output)
+        elif args.command == "force-deactivate":
+            await cmd_force_deactivate(client, args.output)
+        elif args.command == "cancel-force":
+            await cmd_cancel_force(client, args.output)
         elif args.command == "trigger-activate":
             await cmd_trigger_activate(client, args.trigger)
         elif args.command == "trigger-deactivate":

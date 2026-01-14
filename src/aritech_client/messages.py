@@ -352,10 +352,29 @@ for name, msg_id_bytes in [
         },
     )
 
-# Output/Trigger/Zone control
+# Force output commands - these override output state with a forced status
+# Format from capture: c0cf9521 03 00 SSSS 00 07 OOOO
+# byte 3: 03, bytes 4-5: sessionId (2 bytes), byte 6: 00, byte 7: 07 (output type)
+# bytes 8-9: objectId (big-endian)
+for name, msg_id, msg_id_bytes in [
+    ("forceActivateOutput", -271720, [0xCF, 0x95, 0x21]),
+    ("cancelForceOutput", -271784, [0xCF, 0x96, 0x21]),
+    ("forceDeactivateOutput", -271848, [0xCF, 0x97, 0x21]),
+]:
+    _register(
+        name,
+        msg_id=msg_id,
+        msg_id_bytes=msg_id_bytes,
+        template_bytes=[0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00],
+        payload_length=10,
+        properties={
+            "sessionId": [{"byte": 4}, {"byte": 5}],
+            "objectId": [{"byte": 9}, {"byte": 8}],
+        },
+    )
+
+# Trigger/Zone control
 for name, msg_id, msg_id_bytes, payload_len in [
-    ("activateOutput", -276584, [0xCF, 0xE1, 0x21], 8),
-    ("deactivateOutput", -276648, [0xCF, 0xE2, 0x21], 8),
     ("activateTrigger", -272488, [0xCF, 0xA1, 0x21], 9),
     ("deactivateTrigger", -272552, [0xCF, 0xA2, 0x21], 9),
     ("inhibitZone", -270568, [0xCF, 0x83, 0x21], 8),
@@ -442,6 +461,7 @@ _register(
 for name, msg_id, msg_id_bytes in [
     ("getAreaChanges", 165, [0xCA, 0x02]),
     ("getDoorChanges", 741, [0xCA, 0x0B]),
+    ("getFilterChanges", 549, [0xCA, 0x08]),
     ("getOutputChanges", 485, [0xCA, 0x07]),
     ("getTriggerChanges", 1317, [0xCA, 0x14]),
     ("getZoneChanges", 101, [0xCA, 0x01]),
@@ -459,6 +479,7 @@ for name, msg_id, msg_id_bytes in [
 for name, msg_id, msg_id_bytes in [
     ("getAreaStatus", -166, [0xCB, 0x02]),
     ("getDoorStatus", -742, [0xCB, 0x0B]),
+    ("getFilterStatus", -550, [0xCB, 0x08]),
     ("getOutputStatus", -486, [0xCB, 0x07]),
     ("getTriggerStatus", -1318, [0xCB, 0x14]),
     ("getZoneStatus", -102, [0xCB, 0x01]),
@@ -509,6 +530,7 @@ _register(
 for name, type_byte in [
     ("getAreaNames", 0x02),
     ("getDoorNames", 0x0B),
+    ("getFilterNames", 0x08),
     ("getOutputNames", 0x07),
     ("getTriggerNames", 0x14),
     ("getZoneNames", 0x01),
@@ -555,6 +577,7 @@ _register(
 for name, type_byte in [
     ("areaNames", 0x02),
     ("doorNames", 0x0B),
+    ("filterNames", 0x08),
     ("outputNames", 0x07),
     ("triggerNames", 0x14),
     ("zoneNames", 0x01),
@@ -732,6 +755,18 @@ _register(
         "isUnsecured": [{"byte": 5, "mask": 0x10}],
         "isInputActive": [{"byte": 5, "mask": 0x20}],
         "isOutputActive": [{"byte": 5, "mask": 0x40}],
+    },
+)
+
+_register(
+    "filterStatus",
+    msg_id=-25,
+    msg_id_bytes=[0x31],
+    template_bytes=[0x08, 0x00, 0x00, 0x00],
+    payload_length=5,
+    properties={
+        "objectId": [{"byte": 3}],
+        "isActive": [{"byte": 4, "mask": 0x01}],
     },
 )
 

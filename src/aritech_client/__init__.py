@@ -7,7 +7,7 @@ using the ACE 2 ATS protocol version 6.
 
 from __future__ import annotations
 
-from .client import AritechClient, AritechConfig
+from .client import AritechClient, AritechConfig, LoginType
 from .errors import AritechError, ErrorCode
 from .event_parser import (
     EntityType,
@@ -47,9 +47,9 @@ from .protocol import (
     slip_encode,
     verify_crc,
 )
-from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, FilterState, OutputState, TriggerState, ZoneState
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # Version
@@ -57,6 +57,7 @@ __all__ = [
     # Client
     "AritechClient",
     "AritechConfig",
+    "LoginType",
     # Errors
     "AritechError",
     "ErrorCode",
@@ -103,6 +104,7 @@ __all__ = [
     # State classes
     "AreaState",
     "DoorState",
+    "FilterState",
     "OutputState",
     "TriggerState",
     "ZoneState",

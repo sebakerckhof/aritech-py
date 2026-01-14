@@ -25,6 +25,7 @@ COS_CHANGE_TYPES = {
     "ZONE": 0x01,
     "AREA": 0x02,
     "OUTPUT": 0x07,
+    "FILTER": 0x08,
     "DOOR": 0x0B,
     "TRIGGER": 0x14,
     "ALL": 0xFF,
@@ -50,11 +51,13 @@ class InitializedEvent:
     outputs: list[NamedItem]
     triggers: list[NamedItem]
     doors: list[NamedItem]
+    filters: list[NamedItem]
     zone_states: dict[int, dict[str, Any]]
     area_states: dict[int, dict[str, Any]]
     output_states: dict[int, dict[str, Any]]
     trigger_states: dict[int, dict[str, Any]]
     door_states: dict[int, dict[str, Any]]
+    filter_states: dict[int, dict[str, Any]]
 
 
 class AritechMonitor:
@@ -87,11 +90,13 @@ class AritechMonitor:
         self.outputs: list[NamedItem] = []
         self.triggers: list[NamedItem] = []
         self.doors: list[NamedItem] = []
+        self.filters: list[NamedItem] = []
         self.zone_states: dict[int, dict[str, Any]] = {}
         self.area_states: dict[int, dict[str, Any]] = {}
         self.output_states: dict[int, dict[str, Any]] = {}
         self.trigger_states: dict[int, dict[str, Any]] = {}
         self.door_states: dict[int, dict[str, Any]] = {}
+        self.filter_states: dict[int, dict[str, Any]] = {}
 
         # Internal state
         self._running = False
@@ -102,6 +107,7 @@ class AritechMonitor:
         self._on_output_changed: list[Callable[[ChangeEvent], Coroutine[Any, Any, None] | None]] = []
         self._on_trigger_changed: list[Callable[[ChangeEvent], Coroutine[Any, Any, None] | None]] = []
         self._on_door_changed: list[Callable[[ChangeEvent], Coroutine[Any, Any, None] | None]] = []
+        self._on_filter_changed: list[Callable[[ChangeEvent], Coroutine[Any, Any, None] | None]] = []
         self._on_initialized: list[Callable[[InitializedEvent], Coroutine[Any, Any, None] | None]] = []
         self._on_error: list[Callable[[Exception], Coroutine[Any, Any, None] | None]] = []
 
@@ -139,6 +145,12 @@ class AritechMonitor:
     ) -> None:
         """Register a callback for door change events."""
         self._on_door_changed.append(callback)
+
+    def on_filter_changed(
+        self, callback: Callable[[ChangeEvent], Coroutine[Any, Any, None] | None]
+    ) -> None:
+        """Register a callback for filter change events."""
+        self._on_filter_changed.append(callback)
 
     def on_initialized(
         self, callback: Callable[[InitializedEvent], Coroutine[Any, Any, None] | None]
@@ -212,6 +224,10 @@ class AritechMonitor:
     def get_door_states(self) -> dict[int, dict[str, Any]]:
         """Get current state of all doors."""
         return dict(self.door_states)
+
+    def get_filter_states(self) -> dict[int, dict[str, Any]]:
+        """Get current state of all filters."""
+        return dict(self.filter_states)
 
     async def _initialize(self) -> None:
         """Initialize by fetching all zone/area names and their current states."""
@@ -298,6 +314,22 @@ class AritechMonitor:
             }
         logger.debug(f"Captured state for {len(self.door_states)} doors")
 
+        # Fetch filter names
+        logger.debug("Fetching filter names...")
+        self.filters = await self.client.get_filter_names()
+        logger.debug(f"Found {len(self.filters)} filters")
+
+        # Fetch initial filter states
+        if self.filters:
+            logger.debug("Fetching initial filter states...")
+            filter_states = await self.client.get_filter_states([f.number for f in self.filters])
+            for state_result in filter_states:
+                self.filter_states[state_result.number] = {
+                    "state": state_result.state,
+                    "raw_hex": state_result.raw_hex,
+                }
+            logger.debug(f"Captured state for {len(self.filter_states)} filters")
+
         # Emit initialized event
         event = InitializedEvent(
             zones=self.zones,
@@ -305,11 +337,13 @@ class AritechMonitor:
             outputs=self.outputs,
             triggers=self.triggers,
             doors=self.doors,
+            filters=self.filters,
             zone_states=self.get_zone_states(),
             area_states=self.get_area_states(),
             output_states=self.get_output_states(),
             trigger_states=self.get_trigger_states(),
             door_states=self.get_door_states(),
+            filter_states=self.get_filter_states(),
         )
         await self._emit(self._on_initialized, event)
 
@@ -344,6 +378,8 @@ class AritechMonitor:
                     change_type = "output"
                 elif type_byte == COS_CHANGE_TYPES["TRIGGER"]:
                     change_type = "trigger"
+                elif type_byte == COS_CHANGE_TYPES["FILTER"]:
+                    change_type = "filter"
                 elif type_byte == COS_CHANGE_TYPES["DOOR"]:
                     change_type = "door"
                 logger.debug(f"Change type: {change_type}")
@@ -359,6 +395,7 @@ class AritechMonitor:
             changed_outputs: list[int] = []
             changed_triggers: list[int] = []
             changed_doors: list[int] = []
+            changed_filters: list[int] = []
 
             if change_type in ("zone", "all"):
                 changed_zones = await self._get_changes("zone")
@@ -371,6 +408,9 @@ class AritechMonitor:
 
             if change_type in ("trigger", "all"):
                 changed_triggers = await self._get_changes("trigger")
+
+            if change_type in ("filter", "all"):
+                changed_filters = await self._get_changes("filter")
 
             if change_type in ("door", "all"):
                 changed_doors = await self._get_changes("door")
@@ -407,6 +447,12 @@ class AritechMonitor:
                 logger.debug("No specific doors in bitmap, fetching all")
                 await self._update_door_states([d.number for d in self.doors])
 
+            if changed_filters:
+                await self._update_filter_states(changed_filters)
+            elif change_type in ("filter", "all"):
+                logger.debug("No specific filters in bitmap, fetching all")
+                await self._update_filter_states([f.number for f in self.filters])
+
         except Exception as err:
             logger.error(f"Error handling COS event: {err}")
             await self._emit(self._on_error, err)
@@ -418,6 +464,7 @@ class AritechMonitor:
             "area": "getAreaChanges",
             "output": "getOutputChanges",
             "trigger": "getTriggerChanges",
+            "filter": "getFilterChanges",
             "door": "getDoorChanges",
         }
         type_codes = {
@@ -425,6 +472,7 @@ class AritechMonitor:
             "area": COS_CHANGE_TYPES["AREA"],
             "output": COS_CHANGE_TYPES["OUTPUT"],
             "trigger": COS_CHANGE_TYPES["TRIGGER"],
+            "filter": COS_CHANGE_TYPES["FILTER"],
             "door": COS_CHANGE_TYPES["DOOR"],
         }
         valid_numbers_map = {
@@ -432,6 +480,7 @@ class AritechMonitor:
             "area": [a.number for a in self.areas],
             "output": [o.number for o in self.outputs],
             "trigger": [t.number for t in self.triggers],
+            "filter": [f.number for f in self.filters],
             "door": [d.number for d in self.doors],
         }
 
@@ -666,6 +715,45 @@ class AritechMonitor:
 
             # Update stored state
             self.door_states[door_num] = {
+                "state": new_state.state,
+                "raw_hex": new_state.raw_hex,
+            }
+
+    async def _update_filter_states(self, filter_numbers: list[int]) -> None:
+        """Update filter states and emit events for changes."""
+        if not filter_numbers:
+            return
+
+        new_states = await self.client.get_filter_states(filter_numbers)
+
+        for new_state in new_states:
+            filter_num = new_state.number
+            old_state = self.filter_states.get(filter_num)
+
+            # Check if changed by comparing raw bytes
+            has_changed = not old_state or old_state.get("raw_hex") != new_state.raw_hex
+
+            if has_changed:
+                # Find filter name
+                filter_item = next((f for f in self.filters if f.number == filter_num), None)
+                filter_name = filter_item.name if filter_item else f"Filter {filter_num}"
+
+                # Emit event
+                event = ChangeEvent(
+                    id=filter_num,
+                    name=filter_name,
+                    old_data=dict(old_state) if old_state else None,
+                    new_data={"state": new_state.state, "raw_hex": new_state.raw_hex},
+                )
+                await self._emit(self._on_filter_changed, event)
+
+                logger.debug(
+                    f"Filter {filter_num} ({filter_name}): "
+                    f"{old_state.get('raw_hex') if old_state else 'NEW'} -> {new_state.raw_hex}"
+                )
+
+            # Update stored state
+            self.filter_states[filter_num] = {
                 "state": new_state.state,
                 "raw_hex": new_state.raw_hex,
             }

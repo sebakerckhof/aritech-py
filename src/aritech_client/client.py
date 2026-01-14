@@ -48,9 +48,21 @@ from .protocol import (
     slip_encode,
     verify_crc,
 )
-from .state import AreaState, DoorState, OutputState, TriggerState, ZoneState
+from .state import AreaState, DoorState, FilterState, OutputState, TriggerState, ZoneState
 
 logger = logging.getLogger(__name__)
+
+
+class LoginType:
+    """Login type constants for authentication.
+
+    INSTALLER: Login as installer (0x01) - full access but only one session allowed.
+               Note: ATS8500 will not work correctly while logged in as installer.
+    USER: Login as user (0x03) - standard user access.
+    """
+
+    INSTALLER = 0x01
+    USER = 0x03
 
 
 def _debug_enabled() -> bool:
@@ -418,18 +430,25 @@ class AritechClient:
 
         logger.debug("Key exchange complete")
 
-    async def _login(self) -> None:
+    async def _login(self, login_type: int = LoginType.USER) -> None:
         """Login - auto-selects method based on config.
 
         Uses loginWithAccount if username is configured, otherwise loginWithPin.
+
+        Args:
+            login_type: Login type from LoginType enum (USER or INSTALLER).
         """
         if self.config.username:
-            await self._login_with_account()
+            await self._login_with_account(login_type)
         else:
-            await self._login_with_pin()
+            await self._login_with_pin(login_type)
 
-    async def _login_with_pin(self) -> None:
-        """Login with PIN (x500 panels)."""
+    async def _login_with_pin(self, login_type: int = LoginType.USER) -> None:
+        """Login with PIN (x500 panels).
+
+        Args:
+            login_type: Login type from LoginType enum (USER or INSTALLER).
+        """
         logger.debug(f"Logging in with PIN: {self.config.pin}")
 
         login_payload = construct_message(
@@ -442,7 +461,7 @@ class AritechClient:
                 "canDiagnose": True,
                 "canReadLogs": True,
                 "pinCode": self.config.pin,
-                "connectionMethod": 3,  # MobileApps
+                "connectionMethod": login_type,
             },
         )
 
@@ -468,14 +487,17 @@ class AritechClient:
             status=status_code,
         )
 
-    async def _login_with_account(self) -> None:
-        """Login with username/password (x700 panels)."""
+    async def _login_with_account(self, login_type: int = LoginType.USER) -> None:
+        """Login with username/password (x700 panels).
+
+        Args:
+            login_type: Login type from LoginType enum (USER or INSTALLER).
+        """
         logger.debug(f"Logging in with username: {self.config.username}")
 
         # Default password to username if not set
         password = self.config.password or self.config.username
 
-        # connectionMethod: 3 = MobileApps (matches mobile app capture)
         # All permissions set to true except canDownload (matches mobile app for zone control)
         login_payload = construct_message(
             "loginWithAccount",
@@ -488,7 +510,7 @@ class AritechClient:
                 "canReadLogs": True,
                 "username": self.config.username,
                 "password": password,
-                "connectionMethod": 3,  # MobileApps
+                "connectionMethod": login_type,
             },
         )
 
@@ -1719,45 +1741,80 @@ class AritechClient:
 
         return results
 
-    async def activate_output(self, output_num: int) -> None:
-        """Activate an output."""
-        logger.debug(f"Activating output {output_num}...")
+    async def force_activate_output(self, output_num: int) -> None:
+        """
+        Force activate an output (override to ON state).
+
+        This sets the output to active and marks it as overridden.
+        Use cancel_force_output() to remove the override and return to normal state.
+        """
+        logger.debug(f"Force activating output {output_num}...")
 
         async with self._with_control_session(
             "createOutputControlSession", {"area.1": True}, "output", output_num
         ) as session_id:
             payload = construct_message(
-                "activateOutput", {"sessionId": session_id, "objectId": output_num}
+                "forceActivateOutput", {"sessionId": session_id, "objectId": output_num}
             )
             response = await self._call_encrypted(payload, self._session_key)
 
             if parse_return_bool(response) is not True:
                 raise AritechError(
-                    f"Failed to activate output {output_num}",
+                    f"Failed to force activate output {output_num}",
                     code=ErrorCode.OUTPUT_ACTIVATE_FAILED,
                 )
 
-            logger.debug(f"Output {output_num} activated")
+            logger.debug(f"Output {output_num} force activated")
 
-    async def deactivate_output(self, output_num: int) -> None:
-        """Deactivate an output."""
-        logger.debug(f"Deactivating output {output_num}...")
+    async def force_deactivate_output(self, output_num: int) -> None:
+        """
+        Force deactivate an output (override to OFF state).
+
+        This sets the output to inactive and marks it as overridden.
+        Use cancel_force_output() to remove the override and return to normal state.
+        """
+        logger.debug(f"Force deactivating output {output_num}...")
 
         async with self._with_control_session(
             "createOutputControlSession", {"area.1": True}, "output", output_num
         ) as session_id:
             payload = construct_message(
-                "deactivateOutput", {"sessionId": session_id, "objectId": output_num}
+                "forceDeactivateOutput", {"sessionId": session_id, "objectId": output_num}
             )
             response = await self._call_encrypted(payload, self._session_key)
 
             if parse_return_bool(response) is not True:
                 raise AritechError(
-                    f"Failed to deactivate output {output_num}",
+                    f"Failed to force deactivate output {output_num}",
                     code=ErrorCode.OUTPUT_DEACTIVATE_FAILED,
                 )
 
-            logger.debug(f"Output {output_num} deactivated")
+            logger.debug(f"Output {output_num} force deactivated")
+
+    async def cancel_force_output(self, output_num: int) -> None:
+        """
+        Cancel force status on an output (remove override).
+
+        This removes the override flag and returns the output to its normal
+        programmed state.
+        """
+        logger.debug(f"Canceling force on output {output_num}...")
+
+        async with self._with_control_session(
+            "createOutputControlSession", {"area.1": True}, "output", output_num
+        ) as session_id:
+            payload = construct_message(
+                "cancelForceOutput", {"sessionId": session_id, "objectId": output_num}
+            )
+            response = await self._call_encrypted(payload, self._session_key)
+
+            if parse_return_bool(response) is not True:
+                raise AritechError(
+                    f"Failed to cancel force on output {output_num}",
+                    code=ErrorCode.OUTPUT_CANCEL_FORCE_FAILED,
+                )
+
+            logger.debug(f"Output {output_num} force canceled")
 
     # ========================================================================
     # Trigger operations
@@ -1889,6 +1946,54 @@ class AritechClient:
 
         for msg in messages:
             state = DoorState.from_bytes(msg["bytes"])
+            results.append(
+                StateResult(
+                    number=msg["objectId"],
+                    state=state,
+                    raw_hex=msg["bytes"].hex(),
+                )
+            )
+
+        return results
+
+    # ========================================================================
+    # FILTER METHODS
+    # ========================================================================
+
+    async def get_filter_names(self) -> list[NamedItem]:
+        """Get filter names from the panel."""
+        return await self._get_names("getFilterNames", "filterNames", "Filter")
+
+    async def get_filter_states(
+        self, filter_numbers: list[int] | None = None
+    ) -> list[StateResult]:
+        """Get filter states.
+
+        Filters are read-only entities with a simple on/off (active/inactive) state.
+
+        Args:
+            filter_numbers: List of filter numbers to query. Defaults to 1-64.
+
+        Returns:
+            List of StateResult objects with FilterState.
+        """
+        if filter_numbers is None:
+            filter_numbers = list(range(1, 65))
+
+        if not filter_numbers:
+            return []
+
+        payload = build_batch_stat_request("FILTER", filter_numbers)
+        response = await self._call_encrypted(payload, self._session_key)
+
+        if not response or len(response) < 4:
+            return []
+
+        messages = split_batch_response(response, "filterStatus")
+        results: list[StateResult] = []
+
+        for msg in messages:
+            state = FilterState.from_bytes(msg["bytes"])
             results.append(
                 StateResult(
                     number=msg["objectId"],

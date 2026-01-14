@@ -288,6 +288,35 @@ class TriggerState:
 
 
 @dataclass(slots=True)
+class FilterState:
+    """Parsed filter status.
+
+    Filters are read-only entities with a simple on/off state.
+    """
+
+    is_active: bool = False
+    raw_flags: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> FilterState:
+        """Parse filter status from response bytes."""
+        state = cls()
+        if not data or len(data) < 5:
+            return state
+
+        state.raw_flags = _get_all_properties("filterStatus", data)
+        for f in fields(state):
+            if f.name != "raw_flags":
+                camel_name = _snake_to_camel(f.name)
+                setattr(state, f.name, state.raw_flags.get(camel_name, False))
+
+        return state
+
+    def __str__(self) -> str:
+        return "Active" if self.is_active else "Inactive"
+
+
+@dataclass(slots=True)
 class DoorState:
     """Parsed door status."""
 

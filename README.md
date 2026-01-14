@@ -102,10 +102,12 @@ Available commands:
   aritech-cli areas                        - Show area states
   aritech-cli outputs                      - Show output names and states
   aritech-cli triggers                     - Show trigger names and states
+  aritech-cli filters                      - Show filter names and states
   aritech-cli inhibit <zone>               - Inhibit a zone
   aritech-cli uninhibit <zone>             - Uninhibit a zone
-  aritech-cli activate <output>            - Activate an output
-  aritech-cli deactivate <output>          - Deactivate an output
+  aritech-cli force-activate <output>      - Force activate output (override to ON)
+  aritech-cli force-deactivate <output>    - Force deactivate output (override to OFF)
+  aritech-cli cancel-force <output>        - Cancel force on output (return to normal)
   aritech-cli trigger-activate <trigger>   - Activate a trigger
   aritech-cli trigger-deactivate <trigger> - Deactivate a trigger
   aritech-cli event-log [count]            - Read event log (default: 50 events)
@@ -131,9 +133,12 @@ Examples:
   aritech-cli arm 2 part2            - Part arm 2 (set 2)
   aritech-cli arm 1 full --force     - Force full arm area 1
   aritech-cli outputs                - Show all outputs with states
-  aritech-cli activate 1             - Activate output 1
+  aritech-cli force-activate 1       - Force activate output 1 (override to ON)
+  aritech-cli force-deactivate 1     - Force deactivate output 1 (override to OFF)
+  aritech-cli cancel-force 1         - Cancel force on output 1 (return to normal)
   aritech-cli triggers               - Show all triggers with states
   aritech-cli trigger-activate 1     - Activate trigger 1
+  aritech-cli filters                - Show all filters with states
   aritech-cli event-log 50           - Read last 50 events from panel log
 ```
 
@@ -197,6 +202,7 @@ async def main():
         monitor.on_area_changed(lambda e: print(f"Area {e.id} changed: {e.new_data}"))
         monitor.on_output_changed(lambda e: print(f"Output {e.id} changed: {e.new_data}"))
         monitor.on_trigger_changed(lambda e: print(f"Trigger {e.id} changed: {e.new_data}"))
+        monitor.on_filter_changed(lambda e: print(f"Filter {e.id} changed: {e.new_data}"))
 
         await monitor.start()
 
@@ -235,7 +241,8 @@ asyncio.run(main())
 - Read output names
 - Read output states
 - Monitor change events for outputs
-- Activate / Deactivate outputs
+- Force activate / Force deactivate outputs (override state)
+- Cancel force on outputs (return to normal)
 
 ### Triggers
 - Read trigger names
@@ -249,6 +256,13 @@ asyncio.run(main())
 - Monitor change events for doors
 - Enable / Disable doors
 - Lock / Unlock doors
+
+### Filters
+- Read filter names
+- Read filter states (read-only, on/off)
+- Monitor change events for filters
+
+Filters are read-only entities that represent logical conditions in the panel. They have a simple active/inactive state and cannot be controlled directly.
 
 ## API Reference
 
@@ -287,8 +301,9 @@ Main client class for panel communication.
 #### Outputs
 - `get_output_names()` - Get list of output names
 - `get_output_states(output_numbers)` - Get output states
-- `activate_output(output)` - Activate an output
-- `deactivate_output(output)` - Deactivate an output
+- `force_activate_output(output)` - Force activate an output (override to ON)
+- `force_deactivate_output(output)` - Force deactivate an output (override to OFF)
+- `cancel_force_output(output)` - Cancel force on output (return to normal)
 
 #### Triggers
 - `get_trigger_names()` - Get list of trigger names
@@ -296,8 +311,19 @@ Main client class for panel communication.
 - `activate_trigger(trigger)` - Activate a trigger
 - `deactivate_trigger(trigger)` - Deactivate a trigger
 
+#### Filters
+- `get_filter_names()` - Get list of filter names
+- `get_filter_states(filter_numbers)` - Get filter states (read-only)
+
 #### Events
 - `read_event_log(count)` - Async generator yielding parsed events
+
+### LoginType
+
+Login type constants for authentication:
+
+- `LoginType.USER` (0x03) - Standard user access (default)
+- `LoginType.INSTALLER` (0x01) - Installer access with full permissions. Note: Only one installer session allowed at a time. ATS8500 may not work correctly while logged in as installer.
 
 ## Contributing
 

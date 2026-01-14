@@ -20,6 +20,7 @@ HEADER_ERROR = 0xF0
 BATCH_PAYLOAD_LENGTHS = {
     "areaStatus": 17,
     "doorStatus": 6,
+    "filterStatus": 5,
     "zoneStatus": 7,
     "triggerStatus": 5,
     "outputStatus": 5,
@@ -29,6 +30,7 @@ BATCH_PAYLOAD_LENGTHS = {
 GET_STAT_MSG_NAMES = {
     "AREA": "areaStatus",
     "DOOR": "doorStatus",
+    "FILTER": "filterStatus",
     "ZONE": "zoneStatus",
     "TRIGGER": "triggerStatus",
     "OUTPUT": "outputStatus",
