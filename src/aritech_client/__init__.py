@@ -43,13 +43,14 @@ from .protocol import (
     decode_serial,
     encrypt_message,
     make_encryption_key,
+    make_encryption_key_pbkdf2,
     slip_decode,
     slip_encode,
     verify_crc,
 )
 from .state import AreaState, DoorState, FilterState, OutputState, TriggerState, ZoneState
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     # Version
@@ -98,6 +99,7 @@ __all__ = [
     "decode_serial",
     "encrypt_message",
     "make_encryption_key",
+    "make_encryption_key_pbkdf2",
     "slip_decode",
     "slip_encode",
     "verify_crc",

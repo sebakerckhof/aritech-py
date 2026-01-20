@@ -44,6 +44,7 @@ from .protocol import (
     decode_serial,
     encrypt_message,
     make_encryption_key,
+    make_encryption_key_pbkdf2,
     slip_decode,
     slip_encode,
     verify_crc,
@@ -216,6 +217,7 @@ class AritechClient:
         self._panel_name: str | None = None
         self._firmware_version: str | None = None
         self._protocol_version: int | None = None
+        self._encryption_mode: int | None = None  # 1=AES-128, 2=AES-256, 5=PBKDF2+AES-256
 
         # Monitoring state
         self._monitoring_active = False
@@ -282,6 +284,15 @@ class AritechClient:
         x700 panels (ATS1700, ATS3700, ATS4700) use different message formats.
         """
         return bool(self._panel_model and re.match(r"ATS\d700", self._panel_model))
+
+    @property
+    def uses_pbkdf2(self) -> bool:
+        """Check if this panel uses PBKDF2 key derivation.
+
+        Encryption mode 5 uses PBKDF2 + AES-256 with 32-byte session keys.
+        Other modes (1, 2) use grayPack key derivation with 16-byte session keys.
+        """
+        return self._encryption_mode == 5
 
     async def __aenter__(self) -> AritechClient:
         """Async context manager entry."""
@@ -379,11 +390,27 @@ class AritechClient:
                 self.config.serial = serial
                 self._serial_bytes = decode_serial(serial)
 
+            # Encryption mode - byte 79 from start of response
+            # Mode 1/2: grayPack + AES-128/192/256 with 16-byte session key
+            # Mode 5: PBKDF2 + AES-256 with 32-byte session key
+            if len(payload) > 79:
+                self._encryption_mode = payload[79]
+
             logger.debug(f"Panel: {self._panel_name or 'unknown'}")
             logger.debug(f"Model: {self._panel_model or 'unknown'}")
             logger.debug(f"Firmware: {self._firmware_version or 'unknown'}")
+            logger.debug(f"Encryption mode: {self._encryption_mode}")
         except Exception as e:
             logger.debug(f"Could not parse panel description: {e}")
+
+        # Encryption mode 5 uses PBKDF2 key derivation with AES-256
+        # Other modes (1, 2) use grayPack with AES-128/192/256
+        if self.uses_pbkdf2:
+            logger.debug(
+                f"Encryption mode {self._encryption_mode} - using PBKDF2 key derivation (AES-256)"
+            )
+            self._initial_key = make_encryption_key_pbkdf2(self.config.encryption_key)
+            logger.debug(f"New initial key (32 bytes): {self._initial_key.hex()}")
 
         return {
             "panelName": self._panel_name,
@@ -391,19 +418,31 @@ class AritechClient:
             "serial": self.config.serial,
             "firmwareVersion": self._firmware_version,
             "protocolVersion": self._protocol_version,
+            "encryptionMode": self._encryption_mode,
         }
 
     async def _change_session_key(self) -> None:
         """Perform key exchange."""
         logger.debug("Starting key exchange...")
+        logger.debug(f"Initial key: {self._initial_key.hex()}")
 
-        # 1. Send createSession with 8 zeros
-        client_key = bytes(8)
-        begin_payload = construct_message(
-            "createSession",
-            {"typeId": 0x09, "data": client_key + bytes(8)},
-        )
+        # 1. Send createSession with client key contribution
+        # PBKDF2 mode (5): 16-byte client key → 32-byte session key (AES-256)
+        # Other modes: 8-byte client key + 8-byte padding → 16-byte session key (AES-128)
+        if self.uses_pbkdf2:
+            client_key = bytes(16)
+            begin_payload = construct_message(
+                "createSession",
+                {"typeId": 0x09, "data": client_key},  # PBKDF2: full 16 bytes
+            )
+        else:
+            client_key = bytes(8)
+            begin_payload = construct_message(
+                "createSession",
+                {"typeId": 0x09, "data": client_key + bytes(8)},  # grayPack: 8-byte key + 8-byte padding
+            )
 
+        logger.debug("Sending createSession...")
         begin_response = await self._call_encrypted(begin_payload, self._initial_key)
         if not begin_response:
             raise AritechError(
@@ -411,15 +450,22 @@ class AritechClient:
                 code=ErrorCode.KEY_EXCHANGE_FAILED,
             )
 
-        # Extract panel's key portion
-        panel_key = begin_response[3:11]
-        logger.debug(f"Panel key bytes: {panel_key.hex()}")
+        # 2. Extract panel's key contribution and build session key
+        # Response format: [0xA0 header][0x00 0x09 msgId + data][panel key bytes]
+        if self.uses_pbkdf2:
+            # PBKDF2 mode: extract 16-byte panel key, build 32-byte session key
+            panel_key = begin_response[3:19]
+            logger.debug(f"Panel key bytes (16): {panel_key.hex()}")
+            self._session_key = client_key + panel_key
+            logger.debug(f"Session key (32 bytes): {self._session_key.hex()}")
+        else:
+            # grayPack mode: extract 8-byte panel key, build 16-byte session key
+            panel_key = begin_response[3:11]
+            logger.debug(f"Panel key bytes (8): {panel_key.hex()}")
+            self._session_key = client_key + panel_key
+            logger.debug(f"Session key (16 bytes): {self._session_key.hex()}")
 
-        # Build session key
-        self._session_key = client_key + panel_key
-        logger.debug(f"Session key: {self._session_key.hex()}")
-
-        # 2. Send enableEncryptionKey (still with initial key)
+        # 3. Send enableEncryptionKey (still with initial key)
         end_payload = construct_message("enableEncryptionKey", {"typeId": 0x00})
         end_response = await self._call_encrypted(end_payload, self._initial_key)
         if not end_response:

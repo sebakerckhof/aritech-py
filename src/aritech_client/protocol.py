@@ -202,7 +202,7 @@ def _gray_pack(value: int) -> int:
 
 def make_encryption_key(password: str) -> bytes:
     """
-    Derive encryption key from password.
+    Derive encryption key from password using grayPack algorithm.
 
     Password length determines key size:
     - 24 chars (2 parts × 12) → 16-byte key (AES-128)
@@ -238,6 +238,35 @@ def make_encryption_key(password: str) -> bytes:
         result[offset + 7] = _gray_pack(((chars[10] & 0xF) << 8) | chars[11])
 
     return bytes(result)
+
+
+def make_encryption_key_pbkdf2(password: str) -> bytes:
+    """
+    Derive encryption key using PBKDF2 (for x700/Everon panels).
+
+    x700 panels with encryption mode 5 use PBKDF2 with:
+    - Password: the full encryption password string
+    - Salt: 8 zero bytes
+    - Iterations: 1000
+    - Key length: 32 bytes (AES-256)
+    - Hash: SHA-1
+
+    Args:
+        password: Encryption password (24 characters)
+
+    Returns:
+        32-byte encryption key for AES-256
+    """
+    import hashlib
+
+    if not password:
+        return bytes(32)
+
+    salt = bytes(8)  # 8 zero bytes
+    iterations = 1000
+    key_length = 32  # AES-256
+
+    return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), salt, iterations, key_length)
 
 
 def _base64_char_to_val(c: str) -> int:
