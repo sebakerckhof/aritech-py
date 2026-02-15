@@ -57,7 +57,7 @@ def _get_all_properties(template_name: str, payload: bytes) -> dict[str, Any]:
                     if str_len > 0 and byte_offset + 1 + str_len <= len(payload):
                         result[prop_name] = (
                             payload[byte_offset + 1 : byte_offset + 1 + str_len]
-                            .decode("ascii", errors="ignore")
+                            .decode("latin-1")
                             .rstrip("\x00")
                             .strip()
                         )

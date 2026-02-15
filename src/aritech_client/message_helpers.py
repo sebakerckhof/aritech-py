@@ -194,7 +194,7 @@ def get_property(msg_name: str, payload: bytes, property_name: str) -> Any:
             return ""
         return (
             payload[byte_offset + 1 : byte_offset + 1 + str_len]
-            .decode("ascii", errors="ignore")
+            .decode("latin-1")
             .rstrip("\x00")
             .strip()
         )

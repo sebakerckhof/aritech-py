@@ -596,7 +596,7 @@ class AritechClient:
             # Response contains user name at offset 6, 16 bytes
             if len(response) >= 22:
                 user_name = (
-                    response[6:22].decode("ascii", errors="ignore").rstrip("\x00").strip()
+                    response[6:22].decode("latin-1").rstrip("\x00").strip()
                 )
                 if user_name:
                     logger.debug(f"Logged in as: {user_name}")
@@ -1262,7 +1262,7 @@ class AritechClient:
 
                     name_bytes = response[offset : offset + name_length]
                     name = (
-                        name_bytes.decode("ascii", errors="ignore")
+                        name_bytes.decode("latin-1")
                         .rstrip("\x00")
                         .strip()
                     )

@@ -255,7 +255,7 @@ def parse_event(event_buffer: bytes) -> ParsedEvent:
     # Description text (32 bytes for x700, 42 bytes for x500)
     description = (
         event_buffer[28 : 28 + description_length]
-        .decode("ascii", errors="ignore")
+        .decode("latin-1")
         .rstrip("\x00")
         .strip()
     )
