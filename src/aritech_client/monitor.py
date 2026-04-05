@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
+from .errors import AritechError, ErrorCode
 from .message_helpers import HEADER_RESPONSE, construct_message
 
 if TYPE_CHECKING:
@@ -237,98 +238,47 @@ class AritechMonitor:
         # Uses getUserInfo (msgId 228) which triggers COS notification setup
         logger.debug("Enabling event notifications...")
         payload = construct_message("getUserInfo", {})
-        await self.client.call_encrypted(payload, self.client.session_key)
+        try:
+            await self.client.call_encrypted(payload, self.client.session_key)
+        except AritechError as err:
+            logger.warning("getUserInfo failed: %s (continuing)", err)
 
-        # Fetch zone names
-        logger.debug("Fetching zone names...")
-        self.zones = await self.client.get_zone_names()
-        logger.debug(f"Found {len(self.zones)} zones")
+        # Fetch each entity type independently so one failure doesn't block the rest
+        await self._init_entity_type(
+            "zone", "zones",
+            self.client.get_zone_names, self.client.get_zone_states,
+            self.zone_states,
+        )
 
-        # Fetch area names
-        logger.debug("Fetching area names...")
-        self.areas = await self.client.get_area_names()
-        logger.debug(f"Found {len(self.areas)} areas")
+        await self._init_entity_type(
+            "area", "areas",
+            self.client.get_area_names, self.client.get_area_states,
+            self.area_states,
+        )
 
-        # Fetch initial zone states
-        logger.debug("Fetching initial zone states...")
-        zone_states = await self.client.get_zone_states([z.number for z in self.zones])
-        for state_result in zone_states:
-            self.zone_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.zone_states)} zones")
+        await self._init_entity_type(
+            "output", "outputs",
+            self.client.get_output_names, self.client.get_output_states,
+            self.output_states,
+        )
 
-        # Fetch initial area states
-        logger.debug("Fetching initial area states...")
-        area_states = await self.client.get_area_states([a.number for a in self.areas])
-        for state_result in area_states:
-            self.area_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.area_states)} areas")
+        await self._init_entity_type(
+            "trigger", "triggers",
+            self.client.get_trigger_names, self.client.get_trigger_states,
+            self.trigger_states,
+        )
 
-        # Fetch output names
-        logger.debug("Fetching output names...")
-        self.outputs = await self.client.get_output_names()
-        logger.debug(f"Found {len(self.outputs)} outputs")
+        await self._init_entity_type(
+            "door", "doors",
+            self.client.get_door_names, self.client.get_door_states,
+            self.door_states,
+        )
 
-        # Fetch initial output states
-        logger.debug("Fetching initial output states...")
-        output_states = await self.client.get_output_states([o.number for o in self.outputs])
-        for state_result in output_states:
-            self.output_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.output_states)} outputs")
-
-        # Fetch trigger names
-        logger.debug("Fetching trigger names...")
-        self.triggers = await self.client.get_trigger_names()
-        logger.debug(f"Found {len(self.triggers)} triggers")
-
-        # Fetch initial trigger states
-        logger.debug("Fetching initial trigger states...")
-        trigger_states = await self.client.get_trigger_states([t.number for t in self.triggers])
-        for state_result in trigger_states:
-            self.trigger_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.trigger_states)} triggers")
-
-        # Fetch door names
-        logger.debug("Fetching door names...")
-        self.doors = await self.client.get_door_names()
-        logger.debug(f"Found {len(self.doors)} doors")
-
-        # Fetch initial door states
-        logger.debug("Fetching initial door states...")
-        door_states = await self.client.get_door_states([d.number for d in self.doors])
-        for state_result in door_states:
-            self.door_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.door_states)} doors")
-
-        # Fetch filter names
-        logger.debug("Fetching filter names...")
-        self.filters = await self.client.get_filter_names()
-        logger.debug(f"Found {len(self.filters)} filters")
-
-        # Fetch initial filter states
-        if self.filters:
-            logger.debug("Fetching initial filter states...")
-            filter_states = await self.client.get_filter_states([f.number for f in self.filters])
-            for state_result in filter_states:
-                self.filter_states[state_result.number] = {
-                    "state": state_result.state,
-                    "raw_hex": state_result.raw_hex,
-                }
-            logger.debug(f"Captured state for {len(self.filter_states)} filters")
+        await self._init_entity_type(
+            "filter", "filters",
+            self.client.get_filter_names, self.client.get_filter_states,
+            self.filter_states,
+        )
 
         # Emit initialized event
         event = InitializedEvent(
@@ -348,6 +298,43 @@ class AritechMonitor:
         await self._emit(self._on_initialized, event)
 
         logger.debug("Initialization complete")
+
+    async def _init_entity_type(
+        self,
+        entity_name: str,
+        list_attr: str,
+        get_names_fn: Callable,
+        get_states_fn: Callable,
+        states_dict: dict,
+    ) -> None:
+        """Initialize a single entity type with error handling."""
+        # Fetch names
+        try:
+            logger.debug(f"Fetching {entity_name} names...")
+            items = await get_names_fn()
+            setattr(self, list_attr, items)
+            logger.debug(f"Found {len(items)} {entity_name}s")
+        except AritechError as err:
+            logger.warning("Failed to fetch %s names: %s", entity_name, err)
+            setattr(self, list_attr, [])
+            return
+
+        items = getattr(self, list_attr)
+        if not items:
+            return
+
+        # Fetch states
+        try:
+            logger.debug(f"Fetching initial {entity_name} states...")
+            state_results = await get_states_fn([item.number for item in items])
+            for sr in state_results:
+                states_dict[sr.number] = {
+                    "state": sr.state,
+                    "raw_hex": sr.raw_hex,
+                }
+            logger.debug(f"Captured state for {len(states_dict)} {entity_name}s")
+        except AritechError as err:
+            logger.warning("Failed to fetch %s states: %s", entity_name, err)
 
     def _setup_cos_handler(self) -> None:
         """Set up the COS event handler on the client."""

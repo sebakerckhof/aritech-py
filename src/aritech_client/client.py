@@ -1208,17 +1208,53 @@ class AritechClient:
         )
 
         if has_extended_format:
-            name_length = EXTENDED_NAME_LENGTH
-            names_per_page = EXTENDED_NAMES_PER_PAGE
-            actual_msg_name = msg_name + "Extended"
-            logger.debug(
-                f"Using extended format: {actual_msg_name}, "
-                f"{name_length}-byte names, {names_per_page} per page"
-            )
-        else:
-            name_length = NAME_LENGTH
-            names_per_page = NAMES_PER_PAGE
-            actual_msg_name = msg_name
+            try:
+                return await self._get_names_with_format(
+                    msg_name + "Extended",
+                    response_name,
+                    entity_name,
+                    name_length=EXTENDED_NAME_LENGTH,
+                    names_per_page=EXTENDED_NAMES_PER_PAGE,
+                    max_count=max_count,
+                    valid_numbers=valid_numbers,
+                )
+            except AritechError as err:
+                if err.code == ErrorCode.PANEL_ERROR:
+                    logger.warning(
+                        "Extended name query %sExtended not supported "
+                        "(firmware too old?), falling back to standard format",
+                        msg_name,
+                    )
+                else:
+                    raise
+
+        name_length = NAME_LENGTH
+        names_per_page = NAMES_PER_PAGE
+        actual_msg_name = msg_name
+
+        return await self._get_names_with_format(
+            actual_msg_name,
+            response_name,
+            entity_name,
+            name_length=name_length,
+            names_per_page=names_per_page,
+            max_count=max_count,
+            valid_numbers=valid_numbers,
+        )
+
+    async def _get_names_with_format(
+        self,
+        actual_msg_name: str,
+        response_name: str,
+        entity_name: str,
+        *,
+        name_length: int,
+        names_per_page: int,
+        max_count: int | None = None,
+        valid_numbers: list[int] | None = None,
+    ) -> list[NamedItem]:
+        """Fetch entity names using a specific message format."""
+        results: list[NamedItem] = []
 
         # Determine which pages to request
         pages_to_request: list[int] = []
@@ -1366,8 +1402,16 @@ class AritechClient:
             return []
 
         # Use batch request for efficiency
-        payload = build_batch_stat_request("AREA", area_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            payload = build_batch_stat_request("AREA", area_numbers)
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug("Area batch request failed, falling back to individual queries")
+                return await self._get_states_individual(
+                    "AREA", area_numbers, AreaState, "areaStatus"
+                )
+            raise
 
         if not response or len(response) < 4:
             return []
@@ -1485,7 +1529,16 @@ class AritechClient:
         payload = batch_msg + length_byte + b"".join(requests)
 
         logger.debug(f"Zone batch payload ({len(payload)} bytes)")
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug(
+                    "getZonesAssignedToAreas not supported, "
+                    "falling back to individual queries"
+                )
+                return await self._get_valid_zone_numbers_individual(valid_areas)
+            raise
 
         if not response or len(response) < 4:
             logger.debug("No valid batch response for zones")
@@ -1702,6 +1755,47 @@ class AritechClient:
 
         return results
 
+    async def _get_states_individual(
+        self,
+        entity_type: str,
+        entity_numbers: list[int],
+        state_class: type,
+        response_name: str,
+    ) -> list[StateResult]:
+        """
+        Get entity states individually (fallback when batch fails).
+
+        Skips entities that return PANEL_ERROR (non-existent on panel).
+        """
+        logger.debug(f"Using individual {entity_type} state queries")
+        results: list[StateResult] = []
+
+        for entity_num in entity_numbers:
+            try:
+                payload = bytes([0xC0]) + build_get_stat_request(
+                    entity_type, entity_num, False
+                )
+                response = await self._call_encrypted(payload, self._session_key)
+
+                if response and len(response) >= 5:
+                    state = state_class.from_bytes(response)
+                    results.append(
+                        StateResult(
+                            number=entity_num,
+                            state=state,
+                            raw_hex=response.hex(),
+                        )
+                    )
+            except AritechError as err:
+                if err.code == ErrorCode.PANEL_ERROR:
+                    logger.debug(
+                        f"{entity_type} {entity_num}: not available on panel, skipping"
+                    )
+                else:
+                    raise
+
+        return results
+
     async def inhibit_zone(self, zone_num: int) -> None:
         """Inhibit a zone."""
         logger.debug(f"Inhibiting zone {zone_num}...")
@@ -1766,8 +1860,16 @@ class AritechClient:
         if not output_numbers:
             return []
 
-        payload = build_batch_stat_request("OUTPUT", output_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            payload = build_batch_stat_request("OUTPUT", output_numbers)
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug("Output batch request failed, falling back to individual queries")
+                return await self._get_states_individual(
+                    "OUTPUT", output_numbers, OutputState, "outputStatus"
+                )
+            raise
 
         if not response or len(response) < 4:
             return []
@@ -1880,8 +1982,16 @@ class AritechClient:
         if not trigger_numbers:
             return []
 
-        payload = build_batch_stat_request("TRIGGER", trigger_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            payload = build_batch_stat_request("TRIGGER", trigger_numbers)
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug("Trigger batch request failed, falling back to individual queries")
+                return await self._get_states_individual(
+                    "TRIGGER", trigger_numbers, TriggerState, "triggerStatus"
+                )
+            raise
 
         if not response or len(response) < 4:
             return []
@@ -1981,8 +2091,16 @@ class AritechClient:
         if not door_numbers:
             return []
 
-        payload = build_batch_stat_request("DOOR", door_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            payload = build_batch_stat_request("DOOR", door_numbers)
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug("Door batch request failed, falling back to individual queries")
+                return await self._get_states_individual(
+                    "DOOR", door_numbers, DoorState, "doorStatus"
+                )
+            raise
 
         if not response or len(response) < 4:
             return []
@@ -2029,8 +2147,16 @@ class AritechClient:
         if not filter_numbers:
             return []
 
-        payload = build_batch_stat_request("FILTER", filter_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
+        try:
+            payload = build_batch_stat_request("FILTER", filter_numbers)
+            response = await self._call_encrypted(payload, self._session_key)
+        except AritechError as err:
+            if err.code == ErrorCode.PANEL_ERROR:
+                logger.debug("Filter batch request failed, falling back to individual queries")
+                return await self._get_states_individual(
+                    "FILTER", filter_numbers, FilterState, "filterStatus"
+                )
+            raise
 
         if not response or len(response) < 4:
             return []
