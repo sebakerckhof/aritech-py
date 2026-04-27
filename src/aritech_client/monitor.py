@@ -230,7 +230,12 @@ class AritechMonitor:
         return dict(self.filter_states)
 
     async def _initialize(self) -> None:
-        """Initialize by fetching all zone/area names and their current states."""
+        """Initialize by fetching all zone/area names and their current states.
+
+        On x000 panels, outputs/doors/filters are skipped — those entity types
+        are not supported reliably for monitoring on the older protocol.
+        Areas, zones, and triggers are always fetched.
+        """
         logger.debug("Initializing monitor state...")
 
         # Enable event notifications (like mobile app does after login)
@@ -238,6 +243,11 @@ class AritechMonitor:
         logger.debug("Enabling event notifications...")
         payload = construct_message("getUserInfo", {})
         await self.client.call_encrypted(payload, self.client.session_key)
+
+        # x000 panels: monitor areas, zones, and triggers — skip outputs, doors, filters.
+        limited_x000 = bool(getattr(self.client, "is_x000_panel", False))
+        if limited_x000:
+            logger.debug("x000 panel detected — monitoring areas, zones, triggers only")
 
         # Fetch zone names
         logger.debug("Fetching zone names...")
@@ -269,20 +279,23 @@ class AritechMonitor:
             }
         logger.debug(f"Captured state for {len(self.area_states)} areas")
 
-        # Fetch output names
-        logger.debug("Fetching output names...")
-        self.outputs = await self.client.get_output_names()
-        logger.debug(f"Found {len(self.outputs)} outputs")
+        if not limited_x000:
+            # Fetch output names
+            logger.debug("Fetching output names...")
+            self.outputs = await self.client.get_output_names()
+            logger.debug(f"Found {len(self.outputs)} outputs")
 
-        # Fetch initial output states
-        logger.debug("Fetching initial output states...")
-        output_states = await self.client.get_output_states([o.number for o in self.outputs])
-        for state_result in output_states:
-            self.output_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.output_states)} outputs")
+            # Fetch initial output states
+            logger.debug("Fetching initial output states...")
+            output_states = await self.client.get_output_states(
+                [o.number for o in self.outputs]
+            )
+            for state_result in output_states:
+                self.output_states[state_result.number] = {
+                    "state": state_result.state,
+                    "raw_hex": state_result.raw_hex,
+                }
+            logger.debug(f"Captured state for {len(self.output_states)} outputs")
 
         # Fetch trigger names
         logger.debug("Fetching trigger names...")
@@ -291,7 +304,9 @@ class AritechMonitor:
 
         # Fetch initial trigger states
         logger.debug("Fetching initial trigger states...")
-        trigger_states = await self.client.get_trigger_states([t.number for t in self.triggers])
+        trigger_states = await self.client.get_trigger_states(
+            [t.number for t in self.triggers]
+        )
         for state_result in trigger_states:
             self.trigger_states[state_result.number] = {
                 "state": state_result.state,
@@ -299,36 +314,39 @@ class AritechMonitor:
             }
         logger.debug(f"Captured state for {len(self.trigger_states)} triggers")
 
-        # Fetch door names
-        logger.debug("Fetching door names...")
-        self.doors = await self.client.get_door_names()
-        logger.debug(f"Found {len(self.doors)} doors")
+        if not limited_x000:
+            # Fetch door names
+            logger.debug("Fetching door names...")
+            self.doors = await self.client.get_door_names()
+            logger.debug(f"Found {len(self.doors)} doors")
 
-        # Fetch initial door states
-        logger.debug("Fetching initial door states...")
-        door_states = await self.client.get_door_states([d.number for d in self.doors])
-        for state_result in door_states:
-            self.door_states[state_result.number] = {
-                "state": state_result.state,
-                "raw_hex": state_result.raw_hex,
-            }
-        logger.debug(f"Captured state for {len(self.door_states)} doors")
-
-        # Fetch filter names
-        logger.debug("Fetching filter names...")
-        self.filters = await self.client.get_filter_names()
-        logger.debug(f"Found {len(self.filters)} filters")
-
-        # Fetch initial filter states
-        if self.filters:
-            logger.debug("Fetching initial filter states...")
-            filter_states = await self.client.get_filter_states([f.number for f in self.filters])
-            for state_result in filter_states:
-                self.filter_states[state_result.number] = {
+            # Fetch initial door states
+            logger.debug("Fetching initial door states...")
+            door_states = await self.client.get_door_states([d.number for d in self.doors])
+            for state_result in door_states:
+                self.door_states[state_result.number] = {
                     "state": state_result.state,
                     "raw_hex": state_result.raw_hex,
                 }
-            logger.debug(f"Captured state for {len(self.filter_states)} filters")
+            logger.debug(f"Captured state for {len(self.door_states)} doors")
+
+            # Fetch filter names
+            logger.debug("Fetching filter names...")
+            self.filters = await self.client.get_filter_names()
+            logger.debug(f"Found {len(self.filters)} filters")
+
+            # Fetch initial filter states
+            if self.filters:
+                logger.debug("Fetching initial filter states...")
+                filter_states = await self.client.get_filter_states(
+                    [f.number for f in self.filters]
+                )
+                for state_result in filter_states:
+                    self.filter_states[state_result.number] = {
+                        "state": state_result.state,
+                        "raw_hex": state_result.raw_hex,
+                    }
+                logger.debug(f"Captured state for {len(self.filter_states)} filters")
 
         # Emit initialized event
         event = InitializedEvent(
@@ -363,6 +381,9 @@ class AritechMonitor:
             logger.debug(f"Processing COS event, status: {status_str}")
             logger.debug(f"Payload: {payload.hex()}")
 
+            # x000 panels: monitor areas, zones, and triggers — skip outputs, doors, filters.
+            limited_x000 = bool(getattr(self.client, "is_x000_panel", False))
+
             # Parse COS payload to determine what changed
             # Format: 30 00 TT 00 00 00 00 00
             #   TT: 01 = zone, 02 = area, 07 = output, 14 = trigger, ff = all
@@ -384,6 +405,14 @@ class AritechMonitor:
                     change_type = "door"
                 logger.debug(f"Change type: {change_type}")
 
+            x000_supported_change_types = {"area", "zone", "trigger", "all"}
+            if limited_x000 and change_type not in x000_supported_change_types:
+                logger.debug(
+                    f"Skipping {change_type} change "
+                    f"(x000 panel: outputs/doors/filters not monitored)"
+                )
+                return
+
             # Note: COS ACK is sent by the client layer in _handle_unsolicited_frame/_handle_cos_inline
 
             # Small delay before querying
@@ -403,16 +432,16 @@ class AritechMonitor:
             if change_type in ("area", "all"):
                 changed_areas = await self._get_changes("area")
 
-            if change_type in ("output", "all"):
+            if not limited_x000 and change_type in ("output", "all"):
                 changed_outputs = await self._get_changes("output")
 
             if change_type in ("trigger", "all"):
                 changed_triggers = await self._get_changes("trigger")
 
-            if change_type in ("filter", "all"):
+            if not limited_x000 and change_type in ("filter", "all"):
                 changed_filters = await self._get_changes("filter")
 
-            if change_type in ("door", "all"):
+            if not limited_x000 and change_type in ("door", "all"):
                 changed_doors = await self._get_changes("door")
 
             # Update based on what actually changed
@@ -431,7 +460,7 @@ class AritechMonitor:
 
             if changed_outputs:
                 await self._update_output_states(changed_outputs)
-            elif change_type in ("output", "all"):
+            elif not limited_x000 and change_type in ("output", "all"):
                 logger.debug("No specific outputs in bitmap, fetching all")
                 await self._update_output_states([o.number for o in self.outputs])
 
@@ -443,13 +472,13 @@ class AritechMonitor:
 
             if changed_doors:
                 await self._update_door_states(changed_doors)
-            elif change_type in ("door", "all"):
+            elif not limited_x000 and change_type in ("door", "all"):
                 logger.debug("No specific doors in bitmap, fetching all")
                 await self._update_door_states([d.number for d in self.doors])
 
             if changed_filters:
                 await self._update_filter_states(changed_filters)
-            elif change_type in ("filter", "all"):
+            elif not limited_x000 and change_type in ("filter", "all"):
                 logger.debug("No specific filters in bitmap, fetching all")
                 await self._update_filter_states([f.number for f in self.filters])
 

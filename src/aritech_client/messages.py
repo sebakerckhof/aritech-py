@@ -165,6 +165,43 @@ for name, msg_id, msg_id_bytes, payload_len in [
         properties=props,
     )
 
+# Legacy control session templates (x000 panels)
+# x000 panels accept a shorter payload with a 16-bit area bitmap (vs 64-bit on x500/x700).
+def _register_legacy_control_session(
+    name: str, msg_id: int, msg_id_bytes: list[int]
+) -> None:
+    props: dict[str, list[dict[str, Any]]] = {
+        "typeId": [{"byte": 3}],
+        "areas-1-16": [{"byte": 4}, {"byte": 5}],
+    }
+    for i in range(1, 17):
+        byte_offset = (i - 1) // 8
+        bit_offset = (i - 1) % 8
+        props[f"area.{i}"] = [{"byte": 4 + byte_offset, "mask": 1 << bit_offset}]
+
+    _register(
+        name,
+        msg_id=msg_id,
+        msg_id_bytes=msg_id_bytes,
+        template_bytes=[0x00, 0x04, 0x00, 0x00],
+        payload_length=6,
+        properties=props,
+    )
+
+
+for _legacy_name, _legacy_msg_id, _legacy_msg_id_bytes in [
+    ("createPartArmSessionLegacy", 294, [0xCC, 0x04]),
+    ("createPartArm2SessionLegacy", 1062, [0xCC, 0x10]),
+    ("createArmSessionLegacy", 358, [0xCC, 0x05]),
+    ("createDisarmSessionLegacy", 230, [0xCC, 0x03]),
+    ("createOutputControlSessionLegacy", 614, [0xCC, 0x09]),
+    ("createTriggerControlSessionLegacy", 678, [0xCC, 0x0A]),
+    ("createDoorControlSessionLegacy", 1382, [0xCC, 0x15]),
+    ("createZoneControlSessionLegacy", 550, [0xCC, 0x08]),
+]:
+    _register_legacy_control_session(_legacy_name, _legacy_msg_id, _legacy_msg_id_bytes)
+
+
 # Door control session (no area properties needed - uses empty props)
 _register(
     "createDoorControlSession",
@@ -240,6 +277,26 @@ _register(
         "canReadLogs": [{"byte": 9, "type": "byte"}],
         "pinCode": [{"byte": 11, "length": 10}],
         "connectionMethod": [{"byte": 22, "type": "byte"}],
+    },
+)
+
+# x000 panels: legacy PIN login (shorter payload, no connection method tail)
+_register(
+    "loginWithPinLegacy",
+    msg_id=3,
+    msg_id_bytes=[0x06],
+    # Capture: c0 06 060b06 010001010101 0a [10-byte PIN]
+    template_bytes=[0x06, 0x0B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    payload_length=21,
+    properties={
+        "typeId": [{"byte": 3, "type": "byte"}],
+        "canUpload": [{"byte": 4, "type": "byte"}],
+        "canDownload": [{"byte": 5, "type": "byte"}],
+        "canControl": [{"byte": 6, "type": "byte"}],
+        "canMonitor": [{"byte": 7, "type": "byte"}],
+        "canDiagnose": [{"byte": 8, "type": "byte"}],
+        "canReadLogs": [{"byte": 9, "type": "byte"}],
+        "pinCode": [{"byte": 11, "length": 10}],
     },
 )
 
@@ -444,6 +501,20 @@ _register(
         "typeId": [{"byte": 3}],
         "areas-1-32": [{"byte": 4}, {"byte": 5}, {"byte": 6}, {"byte": 7}],
         "areas-33-64": [{"byte": 8}, {"byte": 9}, {"byte": 10}, {"byte": 11}],
+    },
+)
+
+# x000 panels: legacy single-area zone-assignment query
+_register(
+    "getZonesAssignedToAreaLegacy",
+    msg_id=36,
+    msg_id_bytes=[0xC8, 0x00],
+    # Capture: c0 c800 0003 00 area
+    template_bytes=[0x00, 0x03, 0x00, 0x00],
+    payload_length=6,
+    properties={
+        "typeId": [{"byte": 3}],
+        "objectId": [{"byte": 5, "type": "byte"}],
     },
 )
 

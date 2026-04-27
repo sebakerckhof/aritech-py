@@ -223,6 +223,9 @@ class AritechClient:
         self._monitoring_active = False
         self._processing_cos = False
         self._valid_area_numbers: list[int] | None = None
+        # Cached configured trigger numbers. x000 panels expose generated names
+        # for every trigger slot, so this is inferred from non-generated names.
+        self._valid_trigger_numbers: list[int] | None = None
         self._zone_areas: dict[int, list[int]] = {}
 
         # Keep-alive task
@@ -286,6 +289,17 @@ class AritechClient:
         return bool(self._panel_model and re.match(r"ATS\d700", self._panel_model))
 
     @property
+    def is_x000_panel(self) -> bool:
+        """Check if this is an older x000 series panel.
+
+        Detection is firmware-version based: x000 panels report MR_028.x → 28,
+        x500 firmware MR_4.x → 4011, x700 firmware similar. We deliberately do
+        NOT fall back to encryption_mode (x500 also uses AES-128 = mode 1) or
+        panel_model (ATS2000A is shared between x000 and x500 lineups).
+        """
+        return isinstance(self._protocol_version, int) and self._protocol_version < 1000
+
+    @property
     def uses_pbkdf2(self) -> bool:
         """Check if this panel uses PBKDF2 key derivation.
 
@@ -293,6 +307,96 @@ class AritechClient:
         Other modes (1, 2) use grayPack key derivation with 16-byte session keys.
         """
         return self._encryption_mode == 5
+
+    def _uses_legacy_pin_login(self) -> bool:
+        return self.is_x000_panel
+
+    def _uses_legacy_control_session_format(self) -> bool:
+        return self.is_x000_panel
+
+    def _supports_batch_status_requests(self) -> bool:
+        return not self.is_x000_panel
+
+    def _get_create_session_message_name(self, msg_name: str) -> str:
+        """Return the legacy variant of a control session message if applicable."""
+        from .messages import MESSAGE_TEMPLATES
+
+        if self._uses_legacy_control_session_format():
+            legacy_name = f"{msg_name}Legacy"
+            if legacy_name in MESSAGE_TEMPLATES:
+                return legacy_name
+        return msg_name
+
+    def _is_panel_error(self, err: BaseException) -> bool:
+        return isinstance(err, AritechError) and err.code == ErrorCode.PANEL_ERROR
+
+    def _is_known_state(self, state_result: StateResult) -> bool:
+        """Check if a status query produced a meaningful (non-Unknown) state."""
+        state = state_result.state
+        return state is not None and str(state) != "Unknown"
+
+    @staticmethod
+    def _get_numbered_name_prefix(item: NamedItem) -> str | None:
+        """Extract a '<word> <N>' name pattern where N matches the entity number."""
+        if not item.name:
+            return None
+        match = re.match(r"^(.+?)\s+(\d+)$", item.name)
+        if not match:
+            return None
+        if int(match.group(2)) != int(item.number):
+            return None
+        prefix = match.group(1).strip().lower()
+        return prefix or None
+
+    def _get_dominant_numbered_name_prefix(
+        self, items: list[NamedItem]
+    ) -> str | None:
+        prefix_counts: dict[str, int] = {}
+        for item in items:
+            prefix = self._get_numbered_name_prefix(item)
+            if prefix is None:
+                continue
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+
+        if not prefix_counts:
+            return None
+
+        dominant_prefix, dominant_count = max(prefix_counts.items(), key=lambda x: x[1])
+        minimum_count = max(16, (len(items) * 3 + 3) // 4)  # ceil(75%)
+        return dominant_prefix if dominant_count >= minimum_count else None
+
+    def _filter_generated_x000_trigger_names(
+        self, trigger_names: list[NamedItem]
+    ) -> list[NamedItem]:
+        prefix = self._get_dominant_numbered_name_prefix(trigger_names)
+        if prefix is None:
+            return trigger_names
+
+        filtered = [
+            t for t in trigger_names
+            if self._get_numbered_name_prefix(t) != prefix
+        ]
+        skipped = len(trigger_names) - len(filtered)
+        logger.debug(
+            f"x000 panel: filtered {skipped} generated trigger placeholder names"
+        )
+        return filtered
+
+    @staticmethod
+    def _to_entity_numbers(
+        value: int | list[int] | list[NamedItem] | None, default_max: int = 0
+    ) -> list[int]:
+        if value is None:
+            return list(range(1, default_max + 1)) if default_max else []
+        if isinstance(value, list):
+            numbers: list[int] = []
+            for item in value:
+                if isinstance(item, NamedItem):
+                    numbers.append(int(item.number))
+                elif isinstance(item, int):
+                    numbers.append(item)
+            return numbers
+        return list(range(1, int(value) + 1))
 
     async def __aenter__(self) -> AritechClient:
         """Async context manager entry."""
@@ -386,9 +490,14 @@ class AritechClient:
                 )
 
             serial = get_property("deviceDescription", payload, "serialNumber")
-            if serial and re.match(r"^[A-Za-z0-9_+-]{16}$", serial):
-                self.config.serial = serial
-                self._serial_bytes = decode_serial(serial)
+            clean_serial = serial.replace("\x00", "").strip() if serial else ""
+            if re.match(r"^[A-Za-z0-9_+-]{16}$", clean_serial):
+                self.config.serial = clean_serial
+                self._serial_bytes = decode_serial(clean_serial)
+            elif re.match(r"^[0-9A-Fa-f]{12}$", clean_serial):
+                # x000 panels report a 12-char hex serial (no base64 wrapping)
+                self.config.serial = clean_serial.upper()
+                self._serial_bytes = bytes.fromhex(clean_serial)
 
             # Encryption mode - byte 79 from start of response
             # Mode 1/2: grayPack + AES-128/192/256 with 16-byte session key
@@ -490,26 +599,30 @@ class AritechClient:
             await self._login_with_pin(login_type)
 
     async def _login_with_pin(self, login_type: int = LoginType.USER) -> None:
-        """Login with PIN (x500 panels).
+        """Login with PIN (x000/x500 panels).
 
         Args:
             login_type: Login type from LoginType enum (USER or INSTALLER).
         """
         logger.debug(f"Logging in with PIN: {self.config.pin}")
 
-        login_payload = construct_message(
-            "loginWithPin",
-            {
-                "canUpload": True,
-                "canDownload": False,
-                "canControl": True,
-                "canMonitor": True,
-                "canDiagnose": True,
-                "canReadLogs": True,
-                "pinCode": self.config.pin,
-                "connectionMethod": login_type,
-            },
-        )
+        msg_name = "loginWithPinLegacy" if self._uses_legacy_pin_login() else "loginWithPin"
+
+        login_props: dict[str, Any] = {
+            "canUpload": True,
+            "canDownload": False,
+            "canControl": True,
+            "canMonitor": True,
+            "canDiagnose": True,
+            "canReadLogs": True,
+            "pinCode": self.config.pin,
+        }
+
+        # Legacy x000 login has no connection-method tail.
+        if not self._uses_legacy_pin_login():
+            login_props["connectionMethod"] = login_type
+
+        login_payload = construct_message(msg_name, login_props)
 
         response = await self._call_encrypted(login_payload, self._session_key)
         if not response:
@@ -522,6 +635,14 @@ class AritechClient:
             and response[2] == 0x00
         ):
             logger.debug("Login successful")
+
+            # The mobile-app capture for both x000 and x500 panels calls
+            # getUserInfo immediately after PIN login. Failure is non-fatal.
+            try:
+                await self._get_user_info()
+            except Exception as exc:
+                logger.debug(f"getUserInfo after PIN login failed: {exc}")
+
             self._start_keepalive()
             return
 
@@ -1322,7 +1443,8 @@ class AritechClient:
             AritechError: If session creation fails
         """
         async with self._with_command_lock():
-            create_payload = construct_message(create_msg_name, create_props)
+            actual_msg_name = self._get_create_session_message_name(create_msg_name)
+            create_payload = construct_message(actual_msg_name, create_props)
             response = await self._call_encrypted(create_payload, self._session_key)
 
             cc = parse_create_cc_response(response)
@@ -1343,40 +1465,54 @@ class AritechClient:
                 )
 
     # ========================================================================
-    # Area operations
+    # Entity-state query helpers (batch with individual fallback)
     # ========================================================================
 
-    async def get_area_names(self) -> list[NamedItem]:
-        """Get area names from the panel."""
-        return await self._get_names(
-            "getAreaNames",
-            "areaNames",
-            "Area",
-            max_count=self.max_area_count,
+    _STATE_CLASSES: dict[str, type] = {
+        "AREA": AreaState,
+        "ZONE": ZoneState,
+        "OUTPUT": OutputState,
+        "TRIGGER": TriggerState,
+        "DOOR": DoorState,
+        "FILTER": FilterState,
+    }
+
+    _STATE_RESPONSE_NAMES: dict[str, str] = {
+        "AREA": "areaStatus",
+        "ZONE": "zoneStatus",
+        "OUTPUT": "outputStatus",
+        "TRIGGER": "triggerStatus",
+        "DOOR": "doorStatus",
+        "FILTER": "filterStatus",
+    }
+
+    async def _get_entity_states_batch(
+        self, entity_type: str, entity_numbers: list[int]
+    ) -> list[StateResult]:
+        """Send a single batch status request for the given entity numbers."""
+        state_class = self._STATE_CLASSES[entity_type]
+        response_name = self._STATE_RESPONSE_NAMES[entity_type]
+
+        payload = build_batch_stat_request(entity_type, entity_numbers)
+        logger.debug(
+            f"Batch requesting {len(entity_numbers)} {entity_type.lower()} states"
         )
 
-    async def get_area_states(
-        self, area_numbers: list[int] | None = None
-    ) -> list[StateResult]:
-        """Get area states."""
-        if area_numbers is None:
-            area_numbers = list(range(1, self.max_area_count + 1))
-
-        if not area_numbers:
-            return []
-
-        # Use batch request for efficiency
-        payload = build_batch_stat_request("AREA", area_numbers)
         response = await self._call_encrypted(payload, self._session_key)
-
         if not response or len(response) < 4:
+            logger.debug(f"No valid batch response for {entity_type.lower()} states")
             return []
 
-        messages = split_batch_response(response, "areaStatus")
-        results: list[StateResult] = []
+        messages = split_batch_response(response, response_name)
+        if not messages:
+            logger.debug(
+                f"No {entity_type.lower()} messages parsed from batch response"
+            )
+            return []
 
+        results: list[StateResult] = []
         for msg in messages:
-            state = AreaState.from_bytes(msg["bytes"])
+            state = state_class.from_bytes(msg["bytes"])
             results.append(
                 StateResult(
                     number=msg["objectId"],
@@ -1384,6 +1520,125 @@ class AritechClient:
                     raw_hex=msg["bytes"].hex(),
                 )
             )
+        logger.debug(
+            f"Batch received {len(results)} {entity_type.lower()} states"
+        )
+        return results
+
+    async def _get_entity_states_individual(
+        self, entity_type: str, entity_numbers: list[int]
+    ) -> list[StateResult]:
+        """Send one status request per entity. Tolerates panel errors per entity."""
+        state_class = self._STATE_CLASSES[entity_type]
+        response_name = self._STATE_RESPONSE_NAMES[entity_type]
+
+        logger.debug(
+            f"Using individual {entity_type.lower()} state queries "
+            f"({len(entity_numbers)} items)"
+        )
+
+        results: list[StateResult] = []
+        for entity_num in entity_numbers:
+            payload = bytes([HEADER_REQUEST]) + build_get_stat_request(
+                entity_type, entity_num, False
+            )
+
+            try:
+                response = await self._call_encrypted(payload, self._session_key)
+            except AritechError as err:
+                if self._is_panel_error(err):
+                    logger.debug(
+                        f"Panel rejected {entity_type.lower()} {entity_num} status: {err}"
+                    )
+                    continue
+                raise
+
+            if (
+                not response
+                or response[0] != HEADER_RESPONSE
+                or not is_message_type(response, response_name, 1)
+            ):
+                logger.debug(
+                    f"Unexpected {entity_type.lower()} {entity_num} status response"
+                )
+                continue
+
+            msg_bytes = response[1:]
+            object_id = msg_bytes[3] if len(msg_bytes) > 3 else entity_num
+            state = state_class.from_bytes(msg_bytes)
+            results.append(
+                StateResult(
+                    number=object_id,
+                    state=state,
+                    raw_hex=msg_bytes.hex(),
+                )
+            )
+
+        logger.debug(
+            f"Individual queries received {len(results)} {entity_type.lower()} states"
+        )
+        return results
+
+    async def _get_entity_states_with_fallback(
+        self, entity_type: str, entity_numbers: list[int]
+    ) -> list[StateResult]:
+        """Prefer batch; fall back to individual when not supported / on errors."""
+        if not entity_numbers:
+            return []
+
+        if not self._supports_batch_status_requests():
+            return await self._get_entity_states_individual(entity_type, entity_numbers)
+
+        try:
+            results = await self._get_entity_states_batch(entity_type, entity_numbers)
+            if results:
+                return results
+            logger.debug(
+                f"Falling back to individual {entity_type.lower()} status queries"
+            )
+        except AritechError as err:
+            if not self._is_panel_error(err):
+                raise
+            logger.debug(
+                f"Batch {entity_type.lower()} status request rejected, "
+                f"falling back to individual queries: {err}"
+            )
+
+        return await self._get_entity_states_individual(entity_type, entity_numbers)
+
+    # ========================================================================
+    # Area operations
+    # ========================================================================
+
+    async def get_area_names(self) -> list[NamedItem]:
+        """Get area names from the panel."""
+        # On x000 panels we filter to the configured areas first to avoid
+        # querying name pages for slots the panel rejects.
+        valid_numbers: list[int] | None = None
+        if self.is_x000_panel:
+            valid_numbers = await self.get_valid_areas()
+            if not valid_numbers:
+                return []
+
+        return await self._get_names(
+            "getAreaNames",
+            "areaNames",
+            "Area",
+            max_count=self.max_area_count,
+            valid_numbers=valid_numbers,
+        )
+
+    async def get_area_states(
+        self, area_numbers: list[int] | None = None
+    ) -> list[StateResult]:
+        """Get area states (batched on x500/x700, individual on x000)."""
+        numbers = self._to_entity_numbers(area_numbers, default_max=self.max_area_count)
+        results = await self._get_entity_states_with_fallback("AREA", numbers)
+
+        if self.is_x000_panel:
+            # x000 panels report a status (not an error) for unconfigured slots,
+            # so drop entries that parse as "Unknown".
+            results = [r for r in results if self._is_known_state(r)]
 
         return results
 
@@ -1398,6 +1653,18 @@ class AritechClient:
             return self._valid_area_numbers
 
         logger.debug("Querying valid area numbers...")
+
+        # x000 panels return a broad valid-area bitmap. Probe status instead and
+        # keep only areas that respond with a known state.
+        if self.is_x000_panel:
+            area_numbers = list(range(1, self.max_area_count + 1))
+            area_results = await self._get_entity_states_individual("AREA", area_numbers)
+            valid_areas = [r.number for r in area_results if self._is_known_state(r)]
+            logger.debug(
+                f"x000 panel: found {len(valid_areas)} valid areas by status: {valid_areas}"
+            )
+            self._valid_area_numbers = valid_areas
+            return valid_areas
 
         # x700 panels don't support getValidAreas command - use all areas based on model
         if self.is_x700_panel:
@@ -1464,6 +1731,10 @@ class AritechClient:
         if not valid_areas:
             logger.debug("No valid areas found")
             return None
+
+        # x000 panels: ask for the zone bitmap of one area at a time using c8 00.
+        if self.is_x000_panel:
+            return await self._get_valid_zone_numbers_legacy(valid_areas)
 
         # Build batch request - one getZonesAssignedToAreas per area
         requests: list[bytes] = []
@@ -1541,6 +1812,59 @@ class AritechClient:
         valid_zones = sorted(valid_zones_set)
         logger.debug(f"Found {len(valid_zones)} valid zones")
         logger.debug(f"Zone-to-areas mapping: {len(self._zone_areas)} entries")
+        return valid_zones
+
+    async def _get_valid_zone_numbers_legacy(
+        self, valid_areas: list[int]
+    ) -> list[int] | None:
+        """x000 panels: query zone assignments per-area using c8 00 (single-area)."""
+        logger.debug("Using legacy x000 zone assignment queries")
+
+        self._zone_areas = {}
+        valid_zones_set: set[int] = set()
+
+        for area_num in valid_areas:
+            payload = construct_message(
+                "getZonesAssignedToAreaLegacy", {"objectId": area_num}
+            )
+
+            try:
+                response = await self._call_encrypted(payload, self._session_key)
+            except AritechError as err:
+                if self._is_panel_error(err):
+                    logger.debug(
+                        f"Panel rejected legacy zone assignment for area {area_num}: {err}"
+                    )
+                    continue
+                raise
+
+            # Expected response shape: a0 20 02 00 <area> <bitset...>
+            if (
+                not response
+                or len(response) < 5
+                or response[0] != HEADER_RESPONSE
+                or response[1] != 0x20
+                or response[2] != 0x02
+            ):
+                logger.debug(
+                    f"Unexpected legacy zone assignment response for area {area_num}: "
+                    f"{response.hex() if response else 'none'}"
+                )
+                continue
+
+            response_area = response[4] or area_num
+            bitset = response[5:]
+            for byte_idx, byte_val in enumerate(bitset):
+                for bit in range(8):
+                    if byte_val & (1 << bit):
+                        zone_num = byte_idx * 8 + bit + 1
+                        valid_zones_set.add(zone_num)
+                        if zone_num not in self._zone_areas:
+                            self._zone_areas[zone_num] = []
+                        self._zone_areas[zone_num].append(response_area)
+
+        valid_zones = sorted(valid_zones_set)
+        logger.debug(f"Found {len(valid_zones)} valid zones (legacy)")
         return valid_zones
 
     async def _get_valid_zone_numbers_individual(
@@ -1636,71 +1960,16 @@ class AritechClient:
     async def get_zone_states(
         self, zone_numbers: list[int] | None = None
     ) -> list[StateResult]:
-        """Get zone states using batch request."""
-        if zone_numbers is None:
-            zone_numbers = list(range(1, min(24, self.max_zone_count) + 1))
-
-        if not zone_numbers:
-            return []
-
-        payload = build_batch_stat_request("ZONE", zone_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
-
-        if not response or len(response) < 4:
-            logger.debug("No valid batch response, falling back to individual queries")
-            return await self._get_zone_states_individual(zone_numbers)
-
-        messages = split_batch_response(response, "zoneStatus")
-
-        if not messages:
-            logger.debug("No messages parsed from batch, falling back to individual queries")
-            return await self._get_zone_states_individual(zone_numbers)
-
-        results: list[StateResult] = []
-
-        for msg in messages:
-            state = ZoneState.from_bytes(msg["bytes"])
-            results.append(
-                StateResult(
-                    number=msg["objectId"],
-                    state=state,
-                    raw_hex=msg["bytes"].hex(),
-                )
-            )
-
-        return results
+        """Get zone states (batched on x500/x700, individual on x000)."""
+        default_max = min(24, self.max_zone_count)
+        numbers = self._to_entity_numbers(zone_numbers, default_max=default_max)
+        return await self._get_entity_states_with_fallback("ZONE", numbers)
 
     async def _get_zone_states_individual(
         self, zone_numbers: list[int]
     ) -> list[StateResult]:
-        """
-        Get zone states individually (fallback when batch fails).
-
-        Args:
-            zone_numbers: List of zone numbers to query
-
-        Returns:
-            List of zone state results
-        """
-        logger.debug("Using individual zone state queries")
-        results: list[StateResult] = []
-
-        for zone_num in zone_numbers:
-            # Build individual getZoneStatus request
-            payload = bytes([0xC0]) + build_get_stat_request("ZONE", zone_num, False)
-            response = await self._call_encrypted(payload, self._session_key)
-
-            if response and len(response) >= 7 and response[4] == zone_num:
-                state = ZoneState.from_bytes(response)
-                results.append(
-                    StateResult(
-                        number=zone_num,
-                        state=state,
-                        raw_hex=response.hex(),
-                    )
-                )
-
-        return results
+        """Get zone states individually (kept for backward compatibility)."""
+        return await self._get_entity_states_individual("ZONE", zone_numbers)
 
     async def inhibit_zone(self, zone_num: int) -> None:
         """Inhibit a zone."""
@@ -1760,32 +2029,8 @@ class AritechClient:
         self, output_numbers: list[int] | None = None
     ) -> list[StateResult]:
         """Get output states."""
-        if output_numbers is None:
-            output_numbers = list(range(1, 9))
-
-        if not output_numbers:
-            return []
-
-        payload = build_batch_stat_request("OUTPUT", output_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
-
-        if not response or len(response) < 4:
-            return []
-
-        messages = split_batch_response(response, "outputStatus")
-        results: list[StateResult] = []
-
-        for msg in messages:
-            state = OutputState.from_bytes(msg["bytes"])
-            results.append(
-                StateResult(
-                    number=msg["objectId"],
-                    state=state,
-                    raw_hex=msg["bytes"].hex(),
-                )
-            )
-
-        return results
+        numbers = self._to_entity_numbers(output_numbers, default_max=8)
+        return await self._get_entity_states_with_fallback("OUTPUT", numbers)
 
     async def force_activate_output(self, output_num: int) -> None:
         """
@@ -1867,39 +2112,51 @@ class AritechClient:
     # ========================================================================
 
     async def get_trigger_names(self) -> list[NamedItem]:
-        """Get trigger names from the panel."""
-        return await self._get_names("getTriggerNames", "triggerNames", "Trigger")
+        """Get trigger names from the panel.
+
+        On x000 panels, generated placeholder names (e.g. 'Trigger N') are
+        filtered out so only configured triggers appear.
+        """
+        trigger_names = await self._get_names(
+            "getTriggerNames", "triggerNames", "Trigger"
+        )
+
+        if not self.is_x000_panel:
+            return trigger_names
+
+        configured = self._filter_generated_x000_trigger_names(trigger_names)
+        self._valid_trigger_numbers = [t.number for t in configured]
+        logger.debug(
+            f"x000 panel: inferred {len(configured)} configured triggers: "
+            f"{self._valid_trigger_numbers}"
+        )
+        return configured
+
+    async def get_valid_trigger_numbers(self) -> list[int]:
+        """Get configured trigger numbers (cached after first call)."""
+        if self._valid_trigger_numbers is not None:
+            return self._valid_trigger_numbers
+        triggers = await self.get_trigger_names()
+        return [t.number for t in triggers]
 
     async def get_trigger_states(
         self, trigger_numbers: list[int] | None = None
     ) -> list[StateResult]:
         """Get trigger states."""
-        if trigger_numbers is None:
-            trigger_numbers = list(range(1, 9))
+        # On x000 panels, when the caller asks for "all" triggers (default), narrow
+        # the query to configured triggers to avoid panel errors per slot.
+        if (
+            self.is_x000_panel
+            and trigger_numbers is None
+        ):
+            numbers = await self.get_valid_trigger_numbers()
+            if not numbers:
+                # Fall back to a small default range so we still attempt something.
+                numbers = list(range(1, 9))
+        else:
+            numbers = self._to_entity_numbers(trigger_numbers, default_max=8)
 
-        if not trigger_numbers:
-            return []
-
-        payload = build_batch_stat_request("TRIGGER", trigger_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
-
-        if not response or len(response) < 4:
-            return []
-
-        messages = split_batch_response(response, "triggerStatus")
-        results: list[StateResult] = []
-
-        for msg in messages:
-            state = TriggerState.from_bytes(msg["bytes"])
-            results.append(
-                StateResult(
-                    number=msg["objectId"],
-                    state=state,
-                    raw_hex=msg["bytes"].hex(),
-                )
-            )
-
-        return results
+        return await self._get_entity_states_with_fallback("TRIGGER", numbers)
 
     async def activate_trigger(self, trigger_num: int) -> None:
         """Activate a trigger."""
@@ -1975,32 +2232,8 @@ class AritechClient:
         self, door_numbers: list[int] | None = None
     ) -> list[StateResult]:
         """Get door states."""
-        if door_numbers is None:
-            door_numbers = list(range(1, 9))
-
-        if not door_numbers:
-            return []
-
-        payload = build_batch_stat_request("DOOR", door_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
-
-        if not response or len(response) < 4:
-            return []
-
-        messages = split_batch_response(response, "doorStatus")
-        results: list[StateResult] = []
-
-        for msg in messages:
-            state = DoorState.from_bytes(msg["bytes"])
-            results.append(
-                StateResult(
-                    number=msg["objectId"],
-                    state=state,
-                    raw_hex=msg["bytes"].hex(),
-                )
-            )
-
-        return results
+        numbers = self._to_entity_numbers(door_numbers, default_max=8)
+        return await self._get_entity_states_with_fallback("DOOR", numbers)
 
     # ========================================================================
     # FILTER METHODS
@@ -2023,32 +2256,8 @@ class AritechClient:
         Returns:
             List of StateResult objects with FilterState.
         """
-        if filter_numbers is None:
-            filter_numbers = list(range(1, 65))
-
-        if not filter_numbers:
-            return []
-
-        payload = build_batch_stat_request("FILTER", filter_numbers)
-        response = await self._call_encrypted(payload, self._session_key)
-
-        if not response or len(response) < 4:
-            return []
-
-        messages = split_batch_response(response, "filterStatus")
-        results: list[StateResult] = []
-
-        for msg in messages:
-            state = FilterState.from_bytes(msg["bytes"])
-            results.append(
-                StateResult(
-                    number=msg["objectId"],
-                    state=state,
-                    raw_hex=msg["bytes"].hex(),
-                )
-            )
-
-        return results
+        numbers = self._to_entity_numbers(filter_numbers, default_max=64)
+        return await self._get_entity_states_with_fallback("FILTER", numbers)
 
     async def lock_door(self, door_num: int) -> dict[str, Any]:
         """Lock a door."""
@@ -2222,10 +2431,11 @@ class AritechClient:
             "part2": CC_STATUS["PartSet2Inhibited"],
         }
 
-        # Step 1: Create control context
+        # Step 1: Create control context (use legacy template on x000)
+        actual_create_msg_name = self._get_create_session_message_name(create_msg_name)
         area_props = {f"area.{area_num}": True for area_num in area_list}
-        create_payload = construct_message(create_msg_name, area_props)
-        logger.debug(f"Step 1: Sending {create_msg_name}")
+        create_payload = construct_message(actual_create_msg_name, area_props)
+        logger.debug(f"Step 1: Sending {actual_create_msg_name}")
         response = await self._call_encrypted(create_payload, self._session_key)
 
         cc = parse_create_cc_response(response)
@@ -2454,8 +2664,9 @@ class AritechClient:
         """Internal implementation of disarm_area (called with lock held)."""
         logger.debug(f"Disarming area {area_num}...")
 
+        disarm_create_name = self._get_create_session_message_name("createDisarmSession")
         create_payload = construct_message(
-            "createDisarmSession", {f"area.{area_num}": True}
+            disarm_create_name, {f"area.{area_num}": True}
         )
         response = await self._call_encrypted(create_payload, self._session_key)
 
