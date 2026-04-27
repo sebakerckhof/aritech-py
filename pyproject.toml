@@ -7,7 +7,7 @@ name = "aritech-client"
 version = "0.6.0"
 description = "Unofficial Python client library for ATS alarm panels"
 readme = "README.md"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.11"
 authors = [
     {name = "Seba Kerckhof"}
@@ -16,7 +16,6 @@ keywords = ["aritech", "ats", "alarm", "security", "home-automation", "carrier"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",

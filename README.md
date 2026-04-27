@@ -341,4 +341,4 @@ ATS, Advisor, and Aritech are trademarks of KGS Fire & Security. All other trade
 
 ## License
 
-MIT
+AGPL-3.0-or-later
