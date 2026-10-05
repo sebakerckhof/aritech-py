@@ -454,15 +454,18 @@ class AritechClient:
 
         logger.debug("Disconnected from panel")
 
-    async def initialize(self) -> None:
+    async def initialize(self, login_type: int = LoginType.USER) -> None:
         """
         Initialize the connection.
 
         Performs description query, key exchange, and login.
+
+        Args:
+            login_type: Login type from LoginType enum (USER or INSTALLER).
         """
         await self.get_description()
         await self._change_session_key()
-        await self._login()
+        await self._login(login_type)
         self._start_keepalive()
 
     async def get_description(self) -> dict[str, Any]:
@@ -491,7 +494,7 @@ class AritechClient:
 
             serial = get_property("deviceDescription", payload, "serialNumber")
             clean_serial = serial.replace("\x00", "").strip() if serial else ""
-            if re.match(r"^[A-Za-z0-9_+-]{16}$", clean_serial):
+            if re.match(r"^[A-Za-z0-9_+/-]{16}$", clean_serial):
                 self.config.serial = clean_serial
                 self._serial_bytes = decode_serial(clean_serial)
             elif re.match(r"^[0-9A-Fa-f]{12}$", clean_serial):

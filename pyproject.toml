@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aritech-client"
-version = "0.6.0"
+version = "0.6.1"
 description = "Unofficial Python client library for ATS alarm panels"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -44,6 +44,9 @@ aritech-cli = "aritech_client.cli:main"
 [project.urls]
 Homepage = "https://github.com/sebakerckhof/atsadvisor"
 Repository = "https://github.com/sebakerckhof/atsadvisor"
+
+[tool.hatch.build]
+exclude = [".claude"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aritech_client"]
