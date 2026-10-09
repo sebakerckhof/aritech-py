@@ -8,6 +8,7 @@ communicating with ATS alarm panels over TCP/IP.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import re
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -236,6 +237,18 @@ class AritechClient:
 
         # Connection lost callbacks
         self._on_connection_lost: list[Callable[[], Coroutine[Any, Any, None] | None]] = []
+        # Set once per connection: connection-lost is reported at most once, and
+        # never for a disconnect() we initiated ourselves.
+        self._connection_lost_emitted = False
+        self._closing = False
+        # Set after a response timeout: requests carry no id, so a late response
+        # would be taken as the answer to the next request. The connection is
+        # closed and every further call fails until reconnect.
+        self._desynced = False
+        # COS events are handled one at a time, in order (see _queue_cos).
+        self._cos_pending: deque[tuple[int | None, bytes]] = deque()
+        self._cos_worker: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
         # Background reader task - single reader that fans out messages
         self._reader_task: asyncio.Task[None] | None = None
@@ -418,6 +431,10 @@ class AritechClient:
                 timeout=10.0,
             )
             logger.debug("Socket connected")
+            self._receive_buffer.clear()
+            self._connection_lost_emitted = False
+            self._closing = False
+            self._desynced = False
         except asyncio.TimeoutError as e:
             raise AritechError(
                 "Connection timeout", code=ErrorCode.CONNECTION_FAILED
@@ -432,11 +449,12 @@ class AritechClient:
         if not self._writer:
             return
 
+        self._closing = True
         # Stop keep-alive
         self._stop_keepalive()
 
         try:
-            if self._session_key:
+            if self._session_key and not self._desynced:
                 logger.debug("Sending logout...")
                 msg = construct_message("logout", {})
                 await self._call_encrypted(msg, self._session_key)
@@ -453,6 +471,15 @@ class AritechClient:
             self._writer = None
             self._reader = None
 
+        self.stop_background_reader()
+        self._stop_cos_worker()
+        if self._pending_response and not self._pending_response.done():
+            self._pending_response.set_exception(
+                AritechError("Disconnected", code=ErrorCode.CONNECTION_FAILED)
+            )
+        self._pending_response = None
+        self._receive_buffer.clear()
+        self._monitoring_active = False
         logger.debug("Disconnected from panel")
 
     async def initialize(self, login_type: int = LoginType.USER) -> None:
@@ -523,7 +550,7 @@ class AritechClient:
                 f"Encryption mode {self._encryption_mode} - using PBKDF2 key derivation (AES-256)"
             )
             self._initial_key = make_encryption_key_pbkdf2(self.config.encryption_key)
-            logger.debug(f"New initial key (32 bytes): {self._initial_key.hex()}")
+            logger.debug("New initial key derived (32 bytes)")
 
         return {
             "panelName": self._panel_name,
@@ -537,7 +564,7 @@ class AritechClient:
     async def _change_session_key(self) -> None:
         """Perform key exchange."""
         logger.debug("Starting key exchange...")
-        logger.debug(f"Initial key: {self._initial_key.hex()}")
+        logger.debug(f"Initial key: {len(self._initial_key)} bytes")
 
         # 1. Send createSession with client key contribution
         # PBKDF2 mode (5): 16-byte client key → 32-byte session key (AES-256)
@@ -568,15 +595,15 @@ class AritechClient:
         if self.uses_pbkdf2:
             # PBKDF2 mode: extract 16-byte panel key, build 32-byte session key
             panel_key = begin_response[3:19]
-            logger.debug(f"Panel key bytes (16): {panel_key.hex()}")
+            logger.debug("Panel key bytes received (16)")
             self._session_key = client_key + panel_key
-            logger.debug(f"Session key (32 bytes): {self._session_key.hex()}")
+            logger.debug("Session key established (32 bytes)")
         else:
             # grayPack mode: extract 8-byte panel key, build 16-byte session key
             panel_key = begin_response[3:11]
-            logger.debug(f"Panel key bytes (8): {panel_key.hex()}")
+            logger.debug("Panel key bytes received (8)")
             self._session_key = client_key + panel_key
-            logger.debug(f"Session key (16 bytes): {self._session_key.hex()}")
+            logger.debug("Session key established (16 bytes)")
 
         # 3. Send enableEncryptionKey (still with initial key)
         end_payload = construct_message("enableEncryptionKey", {"typeId": 0x00})
@@ -608,7 +635,7 @@ class AritechClient:
         Args:
             login_type: Login type from LoginType enum (USER or INSTALLER).
         """
-        logger.debug(f"Logging in with PIN: {self.config.pin}")
+        logger.debug("Logging in with PIN")
 
         msg_name = "loginWithPinLegacy" if self._uses_legacy_pin_login() else "loginWithPin"
 
@@ -944,13 +971,9 @@ class AritechClient:
                 # Send ACK immediately to prevent panel retransmits
                 await self._send_cos_ack()
 
-                # Spawn listener tasks - don't await them!
-                # This prevents deadlock: listeners may send commands that need
-                # responses from the background reader, so we can't block here.
-                for listener in self._event_listeners:
-                    asyncio.create_task(
-                        self._run_cos_listener(listener, status_byte, payload)
-                    )
+                # Hand off to the COS worker - never await listeners here: they
+                # send commands whose responses this reader has to deliver.
+                self._queue_cos(status_byte, payload)
             else:
                 # Unsolicited message but not a COS - log it
                 msg_id_byte = decrypted[1]
@@ -995,11 +1018,38 @@ class AritechClient:
         # Send ACK immediately to prevent panel retransmits
         await self._send_cos_ack()
 
-        # Spawn listener tasks (don't await to prevent deadlock)
-        for listener in self._event_listeners:
-            asyncio.create_task(
-                self._run_cos_listener(listener, status_byte, payload)
-            )
+        # Hand off to the COS worker (don't await listeners: deadlock)
+        self._queue_cos(status_byte, payload)
+
+    def _queue_cos(self, status_byte: int | None, payload: bytes) -> None:
+        """
+        Queue a COS event for the single COS worker.
+
+        Events are handled one at a time and in order, so a burst of COS messages
+        doesn't start parallel query rounds that compete with user commands for
+        the command lock. An event identical to one still waiting is dropped:
+        its change bitmap will be read by the waiting one anyway.
+        """
+        event = (status_byte, bytes(payload))
+        if event in self._cos_pending:
+            logger.debug("COS event identical to a queued one, merged")
+            return
+        self._cos_pending.append(event)
+        if self._cos_worker is None or self._cos_worker.done():
+            self._cos_worker = self._spawn(self._run_cos_worker())
+
+    async def _run_cos_worker(self) -> None:
+        """Handle queued COS events sequentially."""
+        while self._cos_pending:
+            status_byte, payload = self._cos_pending.popleft()
+            for listener in list(self._event_listeners):
+                await self._run_cos_listener(listener, status_byte, payload)
+
+    def _stop_cos_worker(self) -> None:
+        if self._cos_worker and not self._cos_worker.done():
+            self._cos_worker.cancel()
+        self._cos_worker = None
+        self._cos_pending.clear()
 
     def stop_background_reader(self) -> None:
         """Stop background reader task."""
@@ -1064,7 +1114,10 @@ class AritechClient:
         self._on_connection_lost.append(callback)
 
     async def _emit_connection_lost(self) -> None:
-        """Emit connection lost event to all registered callbacks."""
+        """Emit connection lost event to all registered callbacks (once per connection)."""
+        if self._connection_lost_emitted or self._closing:
+            return
+        self._connection_lost_emitted = True
         for callback in self._on_connection_lost:
             try:
                 result = callback()
@@ -1073,8 +1126,38 @@ class AritechClient:
             except Exception as e:
                 logger.error(f"Error in connection lost callback: {e}")
 
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """create_task that keeps a reference until the task is done."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _mark_desynced(self) -> None:
+        """
+        A response did not arrive in time. Requests carry no id, so if it still
+        arrives it would be taken as the answer to the next request. The pairing
+        can no longer be trusted: close the connection and report it as lost so
+        the caller reconnects.
+        """
+        if self._desynced:
+            return
+        self._desynced = True
+        logger.warning(
+            "No response from panel in time; closing connection because responses "
+            "can no longer be matched to requests"
+        )
+        if self._writer:
+            self._writer.close()
+        self._spawn(self._emit_connection_lost())
+
     async def _send_raw(self, data: bytes) -> None:
         """Send raw bytes."""
+        if self._desynced:
+            raise AritechError(
+                "Connection closed after a response timeout; reconnect required",
+                code=ErrorCode.CONNECTION_FAILED,
+            )
         if not self._writer:
             raise AritechError("Not connected", code=ErrorCode.CONNECTION_FAILED)
         self._writer.write(data)
@@ -1177,7 +1260,12 @@ class AritechClient:
             logger.debug(f"TX (plain): {frame.hex()}")
             await self._send_raw(frame)
 
-            response = await self._receive_frame()
+            try:
+                response = await self._receive_frame()
+            except AritechError as err:
+                if err.code == ErrorCode.TIMEOUT:
+                    self._mark_desynced()
+                raise
         logger.debug(f"RX (plain): {response.hex()}")
 
         decoded = slip_decode(response)
@@ -1248,9 +1336,11 @@ class AritechClient:
                             code=ErrorCode.PROTOCOL_ERROR,
                         )
 
-            except Exception:
+            except Exception as err:
                 if self._pending_response and not self._pending_response.done():
                     self._pending_response = None
+                if isinstance(err, AritechError) and err.code == ErrorCode.TIMEOUT:
+                    self._mark_desynced()
                 raise
 
         decrypted = decrypt_message(response, key, self._serial_bytes)
