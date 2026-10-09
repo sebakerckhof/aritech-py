@@ -390,7 +390,10 @@ _register(
     },
 )
 
-# Zone info commands
+# Zone info commands (fnCC.A_SET_GETACTIVE / GETFAULT / GETINHIB).
+# Same session-id placement as the other session commands (bytes 4-5), then
+# `next` (0 = first item, 1 = following). Verified on an ATS1500: the earlier
+# layout (session at 5-6, 7 template bytes) was answered with a panel error.
 for name, msg_id_bytes in [
     ("getActiveZones", [0xCF, 0x55]),
     ("getFaultZones", [0xCF, 0x52]),
@@ -400,12 +403,12 @@ for name, msg_id_bytes in [
         name,
         msg_id=-5480 if name == "getActiveZones" else (-5288 if name == "getFaultZones" else -5608),
         msg_id_bytes=msg_id_bytes,
-        template_bytes=[0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        payload_length=8,
+        template_bytes=[0x21, 0x00, 0x00, 0x00, 0x00],
+        payload_length=7,
         properties={
             "typeId": [{"byte": 3}],
-            "sessionId": [{"byte": 5}, {"byte": 6}],
-            "next": [{"byte": 7}],
+            "sessionId": [{"byte": 4}, {"byte": 5}],
+            "next": [{"byte": 6}],
         },
     )
 

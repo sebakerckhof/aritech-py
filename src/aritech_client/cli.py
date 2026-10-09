@@ -522,10 +522,11 @@ async def cmd_arm(client: AritechClient, area: int, set_type: str, force: bool) 
         print(f"\u2717 Arm failed: {e}")
         if e.status is not None:
             print(f"  Status: 0x{e.status:04x}")
-        if e.details.get("faults"):
-            print(f"  Faults: {len(e.details['faults'])} zone(s)")
-        if e.details.get("activeZones"):
-            print(f"  Active zones: {len(e.details['activeZones'])} zone(s)")
+        for key, label in (("faults", "Faults"), ("activeZones", "Active zones"), ("inhibitedZones", "Inhibited zones")):
+            zones = e.details.get(key)
+            if zones:
+                numbers = ", ".join(str(z["objectNumber"]) for z in zones)
+                print(f"  {label}: {numbers}")
         if not force:
             print("  Use --force to arm anyway")
 

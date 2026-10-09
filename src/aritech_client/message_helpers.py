@@ -261,6 +261,63 @@ def check_response_error(response: bytes) -> int | None:
     return None
 
 
+# Event categories in return.sysevent (byte offsets are into the full response,
+# i.e. including the 0xA0 header and the 0x20 message id).
+_SYS_EVENT_CATEGORIES = [
+    (9, 0x01, "FAULT"),
+    (9, 0x02, "MAINS"),
+    (9, 0x04, "ACTZN"),
+    (9, 0x08, "ACT24H"),
+    (9, 0x10, "ACTLCD"),
+    (9, 0x20, "ACTDEV"),
+    (9, 0x40, "ALARMS_NCNF"),
+    (9, 0x80, "ALARMS_CNF"),
+    (10, 0x01, "FAULTS_NCNF"),
+    (10, 0x02, "FAULTS_CNF"),
+    (10, 0x10, "WALK_REQ"),
+    (10, 0x20, "WALK_OK"),
+    (10, 0x40, "SYSTEM"),
+]
+
+
+def parse_sys_event(response: bytes | None) -> dict[str, Any] | None:
+    """
+    Parse a return.sysevent response (answer to getActiveZones/getFaultZones/
+    getInhibitedZones during an arm procedure).
+
+    Layout verified on an ATS1500, e.g. a0 20 01 01 9c 01 00 00 00 04 00 00 01 00 16 00 1f ...:
+    zone 22 (classId 1 = zone), area 1, category ACTZN (active zone).
+
+    Returns:
+        Dict with objectNumber, classId, eventTypeId, eventUniqueId, areas,
+        categories and raw hex, or None if this is not a sysevent.
+    """
+    if not response or len(response) < 17 or response[0] != HEADER_RESPONSE or response[1] != 0x20:
+        return None
+    areas = [
+        offset * 8 + bit + 1
+        for offset, byte in enumerate(response[5:9])
+        for bit in range(8)
+        if byte & (1 << bit)
+    ]
+    if len(response) >= 21:
+        areas += [
+            32 + offset * 8 + bit + 1
+            for offset, byte in enumerate(response[17:21])
+            for bit in range(8)
+            if byte & (1 << bit)
+        ]
+    return {
+        "objectNumber": response[14] | (response[15] << 8),
+        "classId": response[12],
+        "eventTypeId": response[16],
+        "eventUniqueId": response[4],
+        "areas": areas,
+        "categories": [name for idx, mask, name in _SYS_EVENT_CATEGORIES if response[idx] & mask],
+        "raw": response.hex(),
+    }
+
+
 def parse_create_cc_response(response: bytes) -> dict[str, int] | None:
     """
     Parse a createCC response to extract sessionId.

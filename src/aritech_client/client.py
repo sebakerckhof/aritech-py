@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from .errors import AritechError, ErrorCode
 from .message_helpers import (
+    parse_sys_event,
     HEADER_ERROR,
     HEADER_REQUEST,
     HEADER_RESPONSE,
@@ -2523,7 +2524,7 @@ class AritechClient:
                     # Read fault zones and throw
                     faults = await self._read_arm_issues(session_id, "getFaultZones")
                     raise AritechError(
-                        "Arm failed - zone faults detected",
+                        f"Arm failed - zone faults detected: {self._describe_zones(faults)}",
                         code=ErrorCode.ARM_FAULTS,
                         status=state_id,
                         details={"faults": faults},
@@ -2556,7 +2557,7 @@ class AritechClient:
                         session_id, "getActiveZones"
                     )
                     raise AritechError(
-                        "Arm failed - active zones detected",
+                        f"Arm failed - active zones detected: {self._describe_zones(active_zones)}",
                         code=ErrorCode.ARM_ACTIVE_ZONES,
                         status=state_id,
                         details={"activeZones": active_zones},
@@ -2590,7 +2591,7 @@ class AritechClient:
                         session_id, "getInhibitedZones"
                     )
                     raise AritechError(
-                        "Arm failed - inhibited zones detected",
+                        f"Arm failed - inhibited zones detected: {self._describe_zones(inhibited_zones)}",
                         code=ErrorCode.ARM_INHIBITED,
                         status=state_id,
                         details={"inhibitedZones": inhibited_zones},
@@ -2617,19 +2618,22 @@ class AritechClient:
         self, session_id: int, message_name: str
     ) -> list[dict[str, Any]]:
         """
-        Read fault/active/inhibited zones during arm procedure.
+        Read fault/active/inhibited zones during an arm procedure.
+
+        The panel answers each request with a return.sysevent (one zone), and
+        ends the list with return.void or an error response.
 
         Args:
             session_id: Control session ID
-            message_name: Message to send ('getFaultZones', 'getActiveZones', 'getInhibitedZones')
+            message_name: 'getFaultZones', 'getActiveZones' or 'getInhibitedZones'
 
         Returns:
-            List of issue dictionaries with raw data
+            One dict per zone, see parse_sys_event() (objectNumber = zone number)
         """
         issues: list[dict[str, Any]] = []
         next_val = 0
 
-        for i in range(100):  # Safety limit
+        for _ in range(100):  # Safety limit
             payload = construct_message(
                 message_name, {"sessionId": session_id, "next": next_val}
             )
@@ -2638,25 +2642,26 @@ class AritechClient:
                     payload, self._session_key, raise_on_error=False
                 )
             except AritechError as err:
-                # Panel may return error when no issues to report
                 logger.debug(f"{message_name}: {err}")
                 break
 
-            if not response or len(response) < 3:
+            event = parse_sys_event(response)
+            if event is None:
+                # return.void / booleanResponse / error: end of the list
                 break
-
-            # Check if response is booleanResponse (end of list)
-            if is_message_type(response, "booleanResponse", 1):
-                break
-
-            # Parse zone info from response
-            if len(response) >= 5:
-                issues.append({"raw": response.hex(), "index": i})
-
-            next_val = 1  # Continue reading
+            issues.append(event)
+            next_val = 1
 
         logger.debug(f"Read {len(issues)} {message_name} zones")
         return issues
+
+    @staticmethod
+    def _describe_zones(issues: list[dict[str, Any]]) -> str:
+        """'zones 22, 4' for error messages."""
+        numbers = [str(i["objectNumber"]) for i in issues]
+        if not numbers:
+            return "(zones unknown)"
+        return ("zone " if len(numbers) == 1 else "zones ") + ", ".join(numbers)
 
     async def disarm_area(self, area_num: int) -> None:
         """Disarm an area."""
