@@ -140,9 +140,12 @@ for name, msg_id, msg_id_bytes in [
         properties=props,
     )
 
-# Output/Trigger/Zone control sessions
+# Output/Trigger/Zone control sessions.
+# Outputs: exactly what the official app sends before force-activating an output on
+# an ATS1500 (capture force-output.log): 0xCC 0x09 with 0x0F in the area byte.
+# 0xCC 0x0E (createCC.OUTPUT, "output test") is refused with a user PIN.
 for name, msg_id, msg_id_bytes, payload_len in [
-    ("createOutputControlSession", 934, [0xCC, 0x0E], 8),
+    ("createOutputControlSession", 614, [0xCC, 0x09], 12),
     ("createTriggerControlSession", 678, [0xCC, 0x0A], 12),
     ("createZoneControlSession", 550, [0xCC, 0x08], 12),
 ]:
@@ -160,7 +163,11 @@ for name, msg_id, msg_id_bytes, payload_len in [
         name,
         msg_id=msg_id,
         msg_id_bytes=msg_id_bytes,
-        template_bytes=[0x00, 0x04, 0x00, 0x00, 0x00, 0x00] if payload_len == 8 else [0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        template_bytes=(
+            [0x00, 0x04, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            if name == "createOutputControlSession"
+            else [0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        ),
         payload_length=payload_len,
         properties=props,
     )
